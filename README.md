@@ -58,4 +58,4 @@ For more information, please refer to the doc
 - [ ] DPO and RLHF on LLM, LMM and MoE. 
 
 ## Credits
-Large portion of the code is borrowed from (EazyLM)[https://github.com/young-geng/EasyLM]
+Large portion of the code is borrowed from [EazyLM](https://github.com/young-geng/EasyLM)
