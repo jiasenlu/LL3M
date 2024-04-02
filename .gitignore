@@ -1,0 +1,30 @@
+checkpoints/*
+*.egg-info/*
+*.pyc
+viz/*
+<<<<<<< HEAD
+wandb/*
+create_data/*/*/test_examples
+create_data/*/*/logs
+create_data/*/*/__pycache__
+=======
+__pycache__
+wandb/*
+create_data/*/*/test_examples
+create_data/*/*/logs
+>>>>>>> cc525dfadf44e71709ebf45321fa99421ad92372
+logs/*
+.vscode/
+checkpoint/*
+output/*
+inference_results/*
+visu/*
+*.jpg
+.ipynb_checkpoints/demo-checkpoint.ipynb
+*.idea
+*.ipynb_checkpoints
+datasets/*
+<<<<<<< HEAD
+=======
+.github
+>>>>>>> cc525dfadf44e71709ebf45321fa99421ad92372
