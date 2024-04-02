@@ -51,11 +51,11 @@ Here, we use seqio to sample different data based on heuristic factors as below
 For more information, please refer to the doc
 
 ## Release Plan
-[x] Language Model and Seqio Dataloader for dolma dataset.
-[ ] Multimodal Model that support LLava, caption and others. 
-[ ] Mixtral type of MoE model that can train from scratch or existing dense models.
-[ ] Souped model that combine differet variances that can serve as init as MoE model. 
-[ ] DPO and RLHF on LLM, LMM and MoE. 
+- [x] Language Model and Seqio Dataloader for dolma dataset.
+- [ ] Multimodal Model that support LLava, caption and others. 
+- [ ] Mixtral type of MoE model that can train from scratch or existing dense models.
+- [ ] Souped model that combine differet variances that can serve as init as MoE model. 
+- [ ] DPO and RLHF on LLM, LMM and MoE. 
 
 ## Credits
 Large portion of the code is borrowed from (EazyLM)[https://github.com/young-geng/EasyLM]
