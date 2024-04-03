@@ -238,7 +238,7 @@ OPEN_LLM_STANDARD_CONFIGS = {
         'vocab_size': 32000,
         'hidden_size': 512,
         'intermediate_size': 512,
-        'num_hidden_layers': 1,
+        'num_hidden_layers': 2,
         'num_attention_heads': 8,
         'max_sequence_length': 4096,
         'initializer_range': 0.02,

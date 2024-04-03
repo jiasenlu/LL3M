@@ -217,11 +217,6 @@ if __name__ == '__main__':
 
   if not (args.tpu and args.script):
     parser.error('No action requested, add --tpu or --script')
-
-  # tpu_creator = TPUCreator(name='jiasen-tpu-3', tpu_size=32)
-  # tpu_creator = TPUCreator(name='jiasen-v3-32-1', tpu_size=256)
-  # tpu_creator = TPUCreator(name='jiasen-v3-512-1', tpu_size=512)
-  # tpu_creator = TPUCreator(name='jiasen-v3-32', tpu_size=32)
   
   tpu_creator = TPUCreator(name=args.tpu, tpu_size=32)
   conns = tpu_creator.get_connections()

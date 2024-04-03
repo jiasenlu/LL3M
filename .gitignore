@@ -2,17 +2,11 @@ checkpoints/*
 *.egg-info/*
 *.pyc
 viz/*
-<<<<<<< HEAD
-wandb/*
-create_data/*/*/test_examples
-create_data/*/*/logs
-create_data/*/*/__pycache__
-=======
 __pycache__
 wandb/*
 create_data/*/*/test_examples
 create_data/*/*/logs
->>>>>>> cc525dfadf44e71709ebf45321fa99421ad92372
+examples_internal/*
 logs/*
 .vscode/
 checkpoint/*
@@ -24,7 +18,4 @@ visu/*
 *.idea
 *.ipynb_checkpoints
 datasets/*
-<<<<<<< HEAD
-=======
 .github
->>>>>>> cc525dfadf44e71709ebf45321fa99421ad92372

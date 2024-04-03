@@ -15,3 +15,11 @@ MixtureRegistry.add(
         ("wiki", 1.66),
     ],
     default_rate=1.0)
+
+MixtureRegistry.add(
+    "wikipedia_mixture",
+    [
+        ("cc_en", 9.09),
+        ("wiki", 90.91),
+    ],
+    default_rate=1.0)

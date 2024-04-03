@@ -324,7 +324,7 @@ def main(argv):
             else:
                 metrics = metrics_update
 
-            if step % (FLAGS.log_freq *  FLAGS.optimizer.accumulate_gradient_steps) == 0:
+            if step % (FLAGS.log_freq *  FLAGS.optimizer.accumulate_gradient_steps) == 0 and step != start_step:
                 if FLAGS.eval_steps > 0:
                     eval_metric_list = []
                     eval_iterator = iter(eval_dataset)
