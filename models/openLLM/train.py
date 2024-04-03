@@ -148,7 +148,6 @@ def main(argv):
             attention_mask=jnp.ones((4, seq_length), dtype=jnp.int32),
             rngs=rng_generator(model_config.rng_keys()),
         )
-        
         return TrainState.create(params=params, tx=optimizer, apply_fn=None)
 
     def train_step(train_state, rng, batch):
@@ -179,7 +178,7 @@ def main(argv):
                 }
             
             return total_loss, aux_metric
-        
+
         grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
         (loss, aux_metric), grads = grad_fn(train_state.params)
         train_state = train_state.apply_gradients(grads=grads)
@@ -296,7 +295,7 @@ def main(argv):
             # Restore from params but initialize train_state            
             train_state = sharded_create_trainstate_from_params(restored_params)
             del restored_params
-
+        
         logging.info('Params count:')
         logging.info('%30s: %15s' %('Total', "{:_}".format(sum(x.size for x in jax.tree_util.tree_leaves(train_state.params)))))
         

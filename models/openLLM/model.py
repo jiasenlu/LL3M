@@ -1272,7 +1272,7 @@ class FlaxOpenLLMForCausalLMModule(nn.Module):
     precision: Union[jax.lax.Precision, str]=jax.lax.Precision.HIGHEST
 
     def setup(self):
-        self.transformer = FlaxOpenLLMModule(self.config, dtype=self.dtype)
+        self.transformer = FlaxOpenLLMModule(self.config, dtype=self.dtype, param_dtype=self.param_dtype)
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             dtype=self.dtype,

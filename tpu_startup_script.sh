@@ -8,9 +8,9 @@ set -e
 screen -d -m python3 -c 'import time; time.sleep(999999999)'
 
 # install the latest 
-sudo apt-get install -y -qq software-properties-common
-sudo add-apt-repository -y ppa:deadsnakes/ppa
-sudo apt-get install -y -qq python3.10-full python3.10-dev
+# sudo apt-get install -y -qq software-properties-common
+# sudo add-apt-repository -y ppa:deadsnakes/ppa
+# sudo apt-get install -y -qq python3.10-full python3.10-dev
 
 # Create venv
 python3.10 -m venv $HOME/.LL3M
