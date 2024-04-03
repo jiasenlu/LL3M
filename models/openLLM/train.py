@@ -26,7 +26,7 @@ from module.jax_utils import (
     cross_entropy_loss_zloss, global_norm, get_float_dtype_by_name,
     set_random_seed, average_metrics, get_weight_decay_mask,
     make_shard_and_gather_fns, with_sharding_constraint, get_trainable_params_mask, 
-    get_local_data, merge_metrics
+    get_local_data, merge_metrics, get_metrics
 )
 from module import metrics as metrics_lib
 import clu
@@ -63,10 +63,6 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     gin_bindings='',
 )
 
-<<<<<<< HEAD
-=======
-
->>>>>>> cc525dfadf44e71709ebf45321fa99421ad92372
 def main(argv):
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
     if FLAGS.gin_config == '': FLAGS.gin_config = None
@@ -83,34 +79,9 @@ def main(argv):
         enable=FLAGS.log_all_worker or (jax.process_index() == 0),
     )
     set_random_seed(FLAGS.seed)
-    
-    if FLAGS.train_dataset.type == 'seqio':
-        tokenizer = get_default_vocabulary(tokenizer_type='llama')
-        mesh = OpenLLMConfig.get_jax_mesh(FLAGS.mesh_dim)
-        dataset = DatasetFactory.load_dataset(
-            FLAGS.train_dataset, tokenizer, 
-            mesh=mesh, feature_converter_cls=LMFeatureConverter)
-        if FLAGS.eval_steps > 0:
-            pass
-        seq_length = dataset.seq_length
-    else:
-        tokenizer = OpenLLMConfig.get_tokenizer(FLAGS.tokenizer)
-        dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
-        if FLAGS.load_dataset_state != '':
-            dataset.load_state_dict(mlxu.load_pickle(FLAGS.load_dataset_state))            
-        if FLAGS.eval_steps > 0:
-            eval_dataset = DatasetFactory.load_dataset(
-                FLAGS.eval_dataset, dataset.tokenizer
-            )
-<<<<<<< HEAD
-            eval_iterator = iter(eval_dataset)
-=======
->>>>>>> cc525dfadf44e71709ebf45321fa99421ad92372
-        seq_length = dataset.seq_length
-    
-    real_batch_size = dataset.config.batch_size
-    simulated_batch_size = real_batch_size * FLAGS.optimizer.accumulate_gradient_steps
-    logging.info(f"Make sure your scheduler steps are based on the simulated batch size: {simulated_batch_size}!")
+
+    mesh = OpenLLMConfig.get_jax_mesh(FLAGS.mesh_dim)
+    tokenizer = get_default_vocabulary()
 
     if FLAGS.load_model_config != '':
         model_config = OpenLLMConfig.load_config(FLAGS.load_model_config)
@@ -125,9 +96,35 @@ def main(argv):
         eos_token_id=tokenizer.eos_token_id,
     ))
     
-    if model_config.vocab_size < dataset.vocab_size:
-        model_config.update(dict(vocab_size=dataset.vocab_size))
+    if model_config.vocab_size < tokenizer.vocab_size:
+        model_config.update(dict(vocab_size=tokenizer.vocab_size))
     
+    eval_dataset = None
+    if FLAGS.train_dataset.type == 'seqio':
+        dataset = DatasetFactory.load_dataset(
+            FLAGS.train_dataset, tokenizer,
+            mesh=mesh, feature_converter_cls=model_config.get_feature_converter)
+    else:
+        tokenizer = OpenLLMConfig.get_tokenizer(FLAGS.tokenizer)
+        dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
+        if FLAGS.load_dataset_state != '':
+            dataset.load_state_dict(mlxu.load_pickle(FLAGS.load_dataset_state))
+    seq_length = dataset.seq_length
+
+    if FLAGS.eval_steps > 0:
+        if FLAGS.eval_dataset.type == 'seqio':
+            eval_dataset = DatasetFactory.load_dataset(
+                FLAGS.eval_dataset, tokenizer,
+                mesh=mesh, feature_converter_cls=model_config.get_feature_converter)
+        else:
+            eval_dataset = DatasetFactory.load_dataset(FLAGS.eval_dataset, tokenizer)
+    else:
+        eval_dataset = None
+    
+    real_batch_size = dataset.config.batch_size
+    simulated_batch_size = real_batch_size * FLAGS.optimizer.accumulate_gradient_steps
+    logging.info(f"Make sure your scheduler steps are based on the simulated batch size: {simulated_batch_size}!")
+
     model = FlaxOpenLLMForCausalLMModule(
         model_config, 
         dtype=get_float_dtype_by_name(FLAGS.dtype), 
@@ -136,7 +133,8 @@ def main(argv):
     
     optimizer, optimizer_info = OptimizerFactory.get_optimizer(
         FLAGS.optimizer,
-        get_weight_decay_mask(OpenLLMConfig.get_weight_decay_exclusions())
+        get_weight_decay_mask(OpenLLMConfig.get_weight_decay_exclusions()),
+        get_trainable_params_mask(OpenLLMConfig.get_trainable_params()),
     )
 
     def create_trainstate_from_params(params):
@@ -205,13 +203,21 @@ def main(argv):
             train_state.params, batch['input_tokens'], deterministic=True,
             rngs=rng_generator(model_config.rng_keys()),
         ).logits
-        loss, z_loss, accuracy = cross_entropy_loss_zloss_and_accuracy(
-            logits, batch['target_tokens'], batch['loss_masks']
+        loss_mask = batch['loss_masks'].astype(jnp.float32) * (batch['loss_masks'] != -1).astype(jnp.float32)
+        targets = batch['target_tokens']
+        
+        loss, z_loss = cross_entropy_loss_zloss(
+            logits, targets, loss_mask, z_loss_alpha=model_config.z_loss
         )
-        metrics = dict(
-            eval_loss=loss,
-            eval_accuracy=accuracy,
-        )
+        
+        metrics = {
+            'eval/accuracy': clu_metrics.Accuracy.from_model_output(
+                logits=logits, labels=targets.astype(jnp.int32), mask=loss_mask
+            ),      
+            'eval/loss': metrics_lib.AveragePerStep(total=loss),
+            'eval/z_loss':  metrics_lib.AveragePerStep(total=z_loss),
+            }
+        
         return rng_generator(), metrics
 
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
@@ -276,7 +282,6 @@ def main(argv):
             milestone=milestone,
         )
 
-    mesh = OpenLLMConfig.get_jax_mesh(FLAGS.mesh_dim)
     with mesh:
         train_state, restored_params = None, None
         if FLAGS.load_checkpoint != '':
@@ -303,13 +308,8 @@ def main(argv):
             start_step = int(jax.device_get(train_state.step))
         
         if FLAGS.optimizer_steps >= 0:
-<<<<<<< HEAD
-            optimizer_step = FLAGS.optimizer_step * FLAGS.optimizer.accumulate_gradient_steps
-            train_state = train_state.replace(step=optimizer_step)
-=======
             optimizer_steps = FLAGS.optimizer_steps * FLAGS.optimizer.accumulate_gradient_steps
             train_state = train_state.replace(step=optimizer_steps)
->>>>>>> cc525dfadf44e71709ebf45321fa99421ad92372
 
         sharded_rng = next_rng()
         step_counter = range(start_step, FLAGS.total_steps * FLAGS.optimizer.accumulate_gradient_steps)
@@ -327,6 +327,7 @@ def main(argv):
             if step % (FLAGS.log_freq *  FLAGS.optimizer.accumulate_gradient_steps) == 0:
                 if FLAGS.eval_steps > 0:
                     eval_metric_list = []
+                    eval_iterator = iter(eval_dataset)
                     for _ in range(FLAGS.eval_steps):
                         eval_batch, _ = next(eval_iterator)
                         sharded_rng, eval_metrics = sharded_eval_step(
@@ -348,13 +349,13 @@ def main(argv):
 
                 jax.tree_util.tree_map(_ensure_not_on_device, final_metrics)
                 final_metrics = jax.tree_util.tree_map(get_local_data, final_metrics)
-                summary = {k: float(v.compute_value().value) for k, v in final_metrics.items()}
+                summary = get_metrics(log_metrics, (FLAGS.log_freq * FLAGS.optimizer.accumulate_gradient_steps))
                 metrics = None
                 
-                logger.log(summary, step=effective_step)                
-                logging.info("step: %d, total_loss: %.3f, accuracy: %.3f, gradient_norm: %.3f, learning_rate: %.3E"        
-                    %(effective_step, summary['total_loss'], summary['accuracy'], 
-                      summary['gradient_norm'], summary['learning_rate']))
+                logger.log(summary, step=effective_step)
+                logging.info("step: %d, total_loss: %.3f, accuracy: %.3f, gradient_norm: %.3f, learning_rate: %.3E"
+                             % (effective_step, summary['train/total_loss'], summary['train/accuracy'],
+                                summary['train/gradient_norm'], summary['train/learning_rate']))
                 
             if FLAGS.save_milestone_freq > 0 and (step + 1) % (FLAGS.save_milestone_freq * FLAGS.optimizer.accumulate_gradient_steps) == 0:
                 logging.info('Saving the milestone checkpoint.')

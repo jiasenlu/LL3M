@@ -38,6 +38,7 @@ from ml_collections import ConfigDict
 from ml_collections.config_dict import config_dict
 from mlxu import function_args_to_config, load_pickle, open_file
 
+from data.data_utils import LMFeatureConverter
 from data.transformer_tokenizer import LLaMATokenizer
 from module.bpt import blockwise_ffn, blockwise_attn
 from module.jax_utils import (
@@ -62,7 +63,7 @@ OPEN_LLM_STANDARD_CONFIGS = {
         'num_hidden_layers': 32,
         'num_attention_heads': 32,
         'num_key_value_heads': 32,
-        'max_sequence_length': 2048,
+        'max_sequence_length': 4096,
         'max_position_embeddings': 8192,
         'rope_theta': 10000.0, 
         'initializer_range': 0.02,
@@ -73,6 +74,26 @@ OPEN_LLM_STANDARD_CONFIGS = {
         'z_loss': 0.001,
         'norm_module': 'RMSNorm',
     },
+    'llama_7b_flash': {
+        'vocab_size': 32000,
+        'hidden_size': 4096,
+        'intermediate_size': 11008,
+        'num_hidden_layers': 32,
+        'num_attention_heads': 32,
+        'num_key_value_heads': 32,
+        'max_sequence_length': 4096,
+        'max_position_embeddings': 8192,
+        'rope_theta': 10000.0, 
+        'initializer_range': 0.02,
+        'rms_norm_eps': 1e-5,
+        'use_cache': True,
+        'tie_word_embeddings': False,
+        'hidden_act': 'silu', 
+        'z_loss': 0.001,
+        'norm_module': 'RMSNorm',
+        'scan_attention': True,
+        'scan_mlp': True,
+    },
     'mistral_7b': {
         'vocab_size': 32000,
         'hidden_size': 4096,
@@ -80,7 +101,7 @@ OPEN_LLM_STANDARD_CONFIGS = {
         'num_hidden_layers': 32,
         'num_attention_heads': 32,
         'num_key_value_heads': 8,
-        'max_sequence_length': 2048,
+        'max_sequence_length': 4096,
         'max_position_embeddings': 32768,
         'rope_theta': 10000.0, 
         'initializer_range': 0.02,
@@ -98,7 +119,7 @@ OPEN_LLM_STANDARD_CONFIGS = {
         'num_hidden_layers': 40,
         'num_attention_heads': 40,
         'num_key_value_heads': 40,
-        'max_sequence_length': 2048,
+        'max_sequence_length': 4096,
         'max_position_embeddings': 8192,
         'initializer_range': 0.02,
         'rms_norm_eps': 1e-5,
@@ -346,6 +367,12 @@ class OpenLLMConfig(PretrainedConfig):
             **kwargs,
         )
 
+    def get_feature_converter(self, **kwargs):
+        return LMFeatureConverter(
+            bos_id=self.bos_token_id,
+            **kwargs
+        )
+
     @classmethod
     def get_default_config(cls, updates=None):
         config = function_args_to_config(cls.__init__)
@@ -388,6 +415,10 @@ class OpenLLMConfig(PretrainedConfig):
     @staticmethod
     def get_weight_decay_exclusions():
         return tuple(['transformer/wte/embedding', 'attention_norm/kernel', 'ffn_norm/kernel'])
+
+    @staticmethod
+    def get_trainable_params():
+        return tuple([r'^.*'])
 
     @staticmethod
     def rng_keys():

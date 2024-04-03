@@ -25,7 +25,7 @@ OutputFeaturesType = Mapping[str, utils.Feature]
 
 
 @gin.configurable
-def get_default_vocabulary(tokenizer_type='llama', has_extra_token=True):
+def get_default_vocabulary(tokenizer_type='llama', has_extra_token=False):
   if tokenizer_type == 'llama':
     return vocab.SentencePieceVocabulary(
       "gs://unified-io-2-us-east/tokenizer/llama_tokenizer.model",

@@ -1,11 +1,3 @@
-"""
-Usage:
-python convert_hf_to_easylm.py  \
-       --checkpoint_dir     /path/hf_format_dir/    \
-       --output_file /path/easylm_format.stream   \
-       --model_size 7b \
-       --streaming
-"""
 import time
 from pathlib import Path
 import argparse
@@ -21,6 +13,17 @@ from safetensors.torch import save_file
 from module.checkpoint import StreamingCheckpointer
 
 OPENLLM_STANDARD_CONFIGS = {
+    "llama2_7b": {
+        "vocab_size": 32000,
+        "additional_vocab_size": 128,
+        "dim": 4096,
+        "intermediate_size": 11008,
+        "n_layers": 32,
+        "n_heads": 32,
+        "norm_eps": 1e-5,
+        "num_key_value_heads": 32,
+        "rope_theta": 10000.0,
+    },
     "mistral_7b": {
         "vocab_size": 32000,
         "dim": 4096,
@@ -89,7 +92,7 @@ def inverse_permute_kv(params, w):
 
 def main(args):
     start = time.time()
-    params = OPENLLM_STANDARD_CONFIGS[args.model_size]
+    params = OPENLLM_STANDARD_CONFIGS[args.model]
 
     
     if args.checkpoint_type == 'safetensors':
@@ -181,10 +184,10 @@ def main(args):
         },
     }
     
-    if 'gemma' not in args.model_size:
-        jax_weights["transformer"]["lm_head"] = {"kernel": jnp.array(ckpt["lm_head.weight"].float().numpy().transpose(), dtype=jnp.bfloat16)}
+    if 'gemma' not in args.model:
+        jax_weights["lm_head"] = {"kernel": jnp.array(ckpt["lm_head.weight"].float().numpy().transpose(), dtype=jnp.bfloat16)}
         
-    print(f"Convert weight to easylm format finished...")
+    print(f"Convert weight to ll3m format finished...")
     print(f"Start to save...")
 
     if args.streaming:
@@ -198,7 +201,7 @@ def main(args):
     )
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="hf to easylm format script")
+    parser = argparse.ArgumentParser(description="hf to ll3m format script")
 
     parser.add_argument(
         "--checkpoint_dir",
@@ -209,7 +212,7 @@ if __name__ == "__main__":
         "--output_file", type=str, help="Save model weight file path, it is a file."
     )
     parser.add_argument(
-        "--model_size",
+        "--model",
         type=str,
         default="7b",
         help="model size",
@@ -231,7 +234,7 @@ if __name__ == "__main__":
 
     print(f"checkpoint_dir: {args.checkpoint_dir}")
     print(f"output_file: {args.output_file}")
-    print(f"model_size: {args.model_size}")
+    print(f"model: {args.model}")
     print(f"streaming: {args.streaming}")
 
     main(args)

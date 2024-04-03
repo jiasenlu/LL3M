@@ -1,0 +1,9 @@
+from __gin__ import dynamic_registration
+import data
+
+from data import preprocessors
+from data import data_utils
+
+data_utils.get_default_vocabulary:
+    tokenizer_type = 'codellama'
+    has_extra_token = False
