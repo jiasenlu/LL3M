@@ -54,15 +54,15 @@ class OptimizerFactory(object):
         config = cls.get_default_config(config)
         if config.type == 'palm':
             optimizer, optimizer_info = PalmOptimizerFactory.get_optimizer(
-                config.palm_optimizer, accumulate_gradient_steps, weight_decay_mask, trainable_params_mask
+                config.palm_optimizer, weight_decay_mask, trainable_params_mask
             )
         elif config.type == 'adamw':
             optimizer, optimizer_info = AdamWOptimizerFactory.get_optimizer(
-                config.adamw_optimizer, accumulate_gradient_steps, weight_decay_mask, trainable_params_mask
+                config.adamw_optimizer, weight_decay_mask, trainable_params_mask
             )
         elif config.type == 'uio':
             optimizer, optimizer_info = UIOOptimizerFactory.get_optimizer(
-                config.uio_optimizer, accumulate_gradient_steps, weight_decay_mask, trainable_params_mask
+                config.uio_optimizer, weight_decay_mask, trainable_params_mask
             )
         else:
             raise ValueError(f'Unknown optimizer type: {config.type}')
@@ -97,13 +97,13 @@ class UIOOptimizerFactory(object):
         return config
 
     @classmethod
-    def get_optimizer(cls, config, accumulate_gradient_steps, weight_decay_mask=None, trainable_params_mask=None):
+    def get_optimizer(cls, config, weight_decay_mask=None, trainable_params_mask=None):
         config = cls.get_default_config(config)
 
         learning_rate_schedule = create_learning_rate_scheduler(
             factors = config.factor,
             base_learning_rate = config.lr,
-            warmup_steps = config.lr_warmup_steps * accumulate_gradient_steps,
+            warmup_steps = config.lr_warmup_steps,
         )
         def weight_decay_schedule(step):
             multiplier = config.weight_decay / 1e-4
@@ -160,7 +160,7 @@ class PalmOptimizerFactory(object):
         return config
 
     @classmethod
-    def get_optimizer(cls, config, accumulate_gradient_steps, weight_decay_mask=None, trainable_params_mask=None):
+    def get_optimizer(cls, config, weight_decay_mask=None, trainable_params_mask=None):
         config = cls.get_default_config(config)
 
         def learning_rate_schedule(step):
@@ -228,14 +228,14 @@ class AdamWOptimizerFactory(object):
         return config
 
     @classmethod
-    def get_optimizer(cls, config, accumulate_gradient_steps, weight_decay_mask=None, trainable_params_mask=None):
+    def get_optimizer(cls, config, weight_decay_mask=None, trainable_params_mask=None):
         config = cls.get_default_config(config)
 
         learning_rate_schedule = optax.warmup_cosine_decay_schedule(
             init_value=config.init_lr,
             peak_value=config.lr,
-            warmup_steps=config.lr_warmup_steps * accumulate_gradient_steps,
-            decay_steps=config.lr_decay_steps * accumulate_gradient_steps,
+            warmup_steps=config.lr_warmup_steps,
+            decay_steps=config.lr_decay_steps,
             end_value=config.end_lr,
         )
 
