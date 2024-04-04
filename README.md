@@ -1,4 +1,4 @@
-# LL3M: Large Language-based and Multi-Modal Model in Jax / Flax
+# LL3M: Large Language and Multi-Modal Model in Jax / Flax
 
 The goal of this repo is to build a Large Language / Multi-Modal Model and MoE Model that easily trains and finetunes in Jax / Flax.
 
