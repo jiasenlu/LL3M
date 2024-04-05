@@ -111,18 +111,17 @@ export WANDB_API_KEY="3c1668c7442671a04f67b6024727f53fd2233e12"
 
 
 python3 -m models.soupLLM.train \
-    --mesh_dim='1,-1,4' \
-    --load_model_config='llava-v1.5-vicuna-7b' \
+    --mesh_dim='1,4, 1,2' \
+    --load_model_config='llama_7b' \
     --train_dataset.type='seqio' \
-    --train_dataset.seqio_dataset.mixture_or_task_name='coco_caption_2017' \
+    --train_dataset.seqio_dataset.mixture_or_task_name='wikipedia_mixture' \
     --train_dataset.seqio_dataset.batch_size=1 \
-    --train_dataset.seqio_dataset.task_feature_field="('targets', 'decoder_loss_weights', 'images', 'image_positions', 'image_input_idx')" \
-    --train_dataset.seqio_dataset.task_feature_lengths='(2048, 2048, 5, 5, 5)' \
-    --train_dataset.seqio_dataset.image_idx_length=576 \
+    --train_dataset.seqio_dataset.task_feature_field="('targets', )" \
+    --train_dataset.seqio_dataset.task_feature_lengths='(2048, )' \
+    --train_dataset.seqio_dataset.shuffle=True \
     --dtype='bf16' \
-    --gin_config='models/soup/config.gin' \
     --optimizer.accumulate_gradient_steps=1 \
-    --load_checkpoint='params::checkpoints/soup_debug-4-expert-ll3m' \
+    # --load_checkpoint='params::checkpoints/soup_debug-ll3m' \
     # --gin_bindings='data.data_utils.get_default_vocabulary.tokenizer_type="llama", data.data_utils.get_default_vocabulary.has_extra_token=True, data.preprocessors.image_to_patches_and_tokens.image_token_length_h=24, data.preprocessors.image_to_patches_and_tokens.image_token_length_w=24'
 
 # python3 -m models.llama2.train \

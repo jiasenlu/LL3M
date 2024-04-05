@@ -32,11 +32,11 @@ from module import metrics as metrics_lib
 import clu
 import clu.metrics as clu_metrics
 
-from models.openLLM.model import SoupLLMConfig, FlaxSoupLLMForCausalLMModule
+from models.soupLLM.model import SoupLLMConfig, FlaxSoupLLMForCausalLMModule
 
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     seed=42,
-    mesh_dim='1,-1,1',
+    mesh_dim='1,-1,1,1',
     dtype='bf16',
     param_dtype='float32',
     total_steps=10000,
@@ -143,16 +143,16 @@ def main(argv):
     def init_fn(rng):
         rng_generator = JaxRNG(rng)
         params = model.init(
-            input_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
-            position_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
-            attention_mask=jnp.ones((4, seq_length), dtype=jnp.int32),
+            input_ids=jnp.zeros((1, seq_length), dtype=jnp.int32),
+            position_ids=jnp.zeros((1, seq_length), dtype=jnp.int32),
+            attention_mask=jnp.ones((1, seq_length), dtype=jnp.int32),
             rngs=rng_generator(model_config.rng_keys()),
         )
         return TrainState.create(params=params, tx=optimizer, apply_fn=None)
 
     def train_step(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
-        batch = with_sharding_constraint(batch, PS('dp', 'fsdp'))
+        batch = with_sharding_constraint(batch, PS(('dp', 'expert'), 'fsdp'))
         
         def loss_and_accuracy(params):
             outputs = model.apply(
@@ -198,7 +198,7 @@ def main(argv):
 
     def eval_step(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
-        batch = with_sharding_constraint(batch, PS('dp', 'fsdp'))
+        batch = with_sharding_constraint(batch, PS(('dp', 'expert'), 'fsdp'))
         logits = model.apply(
             train_state.params, batch['input_tokens'], deterministic=True,
             rngs=rng_generator(model_config.rng_keys()),

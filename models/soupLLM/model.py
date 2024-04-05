@@ -19,6 +19,10 @@ from jax import random
 
 import flax
 import flax.linen as nn
+from flax.linen import initializers
+from flax.linen.dtypes import promote_dtype
+from flax.linen.module import compact
+
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from flax.linen.attention import dot_product_attention_weights
@@ -45,6 +49,8 @@ from module.jax_utils import (
     with_sharding_constraint, get_gradient_checkpoint_policy, get_jax_mesh
 )
 
+from flax.typing import Dtype, PrecisionLike, DotGeneralT
+
 Array = jnp.ndarray
 DType = jnp.dtype
 PRNGKey = jnp.ndarray
@@ -52,6 +58,7 @@ Shape = Sequence[int]
 Activation = Callable[..., Array]
 # Parameter initializers.
 Initializer = Callable[[PRNGKey, Shape, DType], Array]
+default_kernel_init = initializers.lecun_normal()
 
 HIDDEN_ACT_MAPPING = {'silu': nn.silu, 'gelu': nn.gelu}
 
@@ -60,7 +67,7 @@ OPEN_LLM_STANDARD_CONFIGS = {
         'vocab_size': 32000,
         'hidden_size': 4096,
         'intermediate_size': 11008,
-        'num_hidden_layers': 32,
+        'num_hidden_layers': 2,
         'num_attention_heads': 32,
         'num_key_value_heads': 32,
         'max_sequence_length': 4096,
@@ -73,6 +80,7 @@ OPEN_LLM_STANDARD_CONFIGS = {
         'hidden_act': 'silu', 
         'z_loss': 0.001,
         'norm_module': 'RMSNorm',
+        'expert_size': 4
     },
     'debug': { # A small model for debugging
         'vocab_size': 32000,
@@ -224,7 +232,7 @@ class SoupLLMConfig(PretrainedConfig):
 
     @staticmethod
     def get_jax_mesh(axis_dims):
-        return get_jax_mesh(axis_dims, ('dp', 'fsdp', 'mp'))
+        return get_jax_mesh(axis_dims, ('dp', 'expert', 'fsdp', 'mp'))
     
     @staticmethod
     def get_partition_rules():
@@ -235,21 +243,24 @@ class SoupLLMConfig(PretrainedConfig):
         """
         return (
             # embeddings
-            ("transformer/wte/embedding", PS("mp", "fsdp")),
+            ("transformer/wte/embedding", PS("expert", "mp", "fsdp")),
             # atention
-            ("attention/(wq|wk|wv)/kernel", PS("fsdp", "mp")),
-            ("attention/wo/kernel", PS("mp", "fsdp")),
+            ("attention/(wq|wk|wv)/kernel", PS("expert", "fsdp", "mp")),
+            ("attention/wo/kernel", PS("expert", "mp", "fsdp")),
             # mlp
-            ("feed_forward/w1/kernel", PS("fsdp", "mp")),
-            ("feed_forward/w2/kernel", PS("mp", "fsdp")),
-            ("feed_forward/w3/kernel", PS("fsdp", "mp")),
+            ("feed_forward/w1/kernel", PS("expert", "fsdp", "mp")),
+            ("feed_forward/w2/kernel", PS("expert", "mp", "fsdp")),
+            ("feed_forward/w3/kernel", PS("expert", "fsdp", "mp")),
             # layer normss
-            ("attention_norm/kernel", PS(None)),
-            ("ffn_norm/kernel", PS(None)),
+            ("attention_norm/kernel", PS("expert", None)),
+            ("ffn_norm/kernel", PS("expert", None)),
             # output head
-            ("transformer/ln_f/kernel", PS(None)),
-            ("lm_head/kernel", PS("fsdp", "mp")),
-            ('.*', PS(None)),
+            ("transformer/ln_f/kernel", PS("expert", None)),
+            ("lm_head/kernel", PS("expert", "fsdp", "mp")),
+            # alpha            
+            (".alpha", PS("expert",)),
+
+            ('.*', PS("expert", None)),
         )
 
     @staticmethod
@@ -258,7 +269,17 @@ class SoupLLMConfig(PretrainedConfig):
 
     @staticmethod
     def get_trainable_params():
-        return tuple([r'^.*'])
+        return tuple(
+            [
+                "transformer/wte/embedding", 
+                "attention/(wq|wk|wv|wo)/kernel",
+                "feed_forward/(w1|w2|w3)/kernel",
+                "attention_norm/kernel",
+                "ffn_norm/kernel",
+                "transformer/ln_f/kernel",
+                "lm_head/kernel",
+            ]
+        )
 
     @staticmethod
     def rng_keys():
@@ -307,7 +328,79 @@ remat = nn_partitioning.remat
 
 logger = logging.get_logger(__name__)
 
-class RMSNorm(nn.Module):
+default_embed_init = initializers.variance_scaling(
+  1.0, 'fan_in', 'normal', out_axis=0
+)
+
+def normalize(x, axis=None, eps=1e-12):
+    """Normalizes along dimension `axis` using an L2 norm.
+    This specialized function exists for numerical stability reasons.
+    Args:
+      x: An input ndarray.
+      axis: Dimension along which to normalize, e.g. `1` to separately normalize
+        vectors in a batch. Passing `None` views `t` as a flattened vector when
+        calculating the norm (equivalent to Frobenius norm).
+      eps: Epsilon to avoid dividing by zero.
+    Returns:
+      An array of the same shape as 'x' L2-normalized along 'axis'.
+    """
+    return x / (x.sum(axis=axis, keepdims=True) + eps)
+
+
+class SoupEmbed(nn.Module):
+    """Soup Embedding Module.
+    """
+    num_experts: int
+    num_embeddings: int
+    features: int
+    dtype: Optional[Dtype] = None
+    param_dtype: Dtype = jnp.float32
+    embedding_init: Initializer = default_embed_init
+
+    def setup(self):
+        self.embedding = self.param(
+            'embedding',
+            self.embedding_init,
+            (self.num_experts, self.num_embeddings, self.features),
+            self.param_dtype,
+        )
+        self.alpha = self.param(
+            'alpha', 
+            jax.nn.initializers.constant(1.0), 
+            (self.num_experts,), 
+            self.param_dtype
+        )
+
+    def __call__(self, inputs: Array) -> Array:
+        """Embeds the inputs along the last dimension.
+
+        Args:
+            inputs: input data, all dimensions are considered batch dimensions.
+            Values in the input array must be integers.
+
+        Returns:
+            Output which is embedded input data.  The output shape follows the input,
+            with an additional ``features`` dimension appended.
+        """
+        if not jnp.issubdtype(inputs.dtype, jnp.integer):
+            raise ValueError('Input type must be an integer or unsigned integer.')
+        # Use take because fancy indexing numpy arrays with JAX indices does not
+        # work correctly.
+        (embedding,) = promote_dtype(
+            self.embedding, dtype=self.dtype, inexact=False
+        )    
+        embedding = jnp.sum(normalize(self.alpha[:,None,None], 0) * embedding, axis=0)
+        if self.num_embeddings == 1:
+            return jnp.where(
+                jnp.broadcast_to(inputs[..., None], inputs.shape + (self.features,))
+                == 0,
+                embedding,
+                jnp.nan,
+            )
+        return jnp.take(embedding, inputs, axis=0)
+
+class SoupRMSNorm(nn.Module):
+    num_experts: int
     dim: int
     eps: float=1e-6
     dtype: jnp.dtype=jnp.float32
@@ -317,8 +410,14 @@ class RMSNorm(nn.Module):
         self.weight = self.param(
             'kernel',
             nn.initializers.ones,
-            (self.dim,),
+            (self.num_experts, self.dim,),
             self.param_dtype,
+        )
+        self.alpha = self.param(
+            'alpha', 
+            jax.nn.initializers.constant(1.0), 
+            (self.num_experts,), 
+            self.param_dtype
         )
 
     def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -328,9 +427,11 @@ class RMSNorm(nn.Module):
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
         weight = jnp.asarray(self.weight, self.dtype)
+        weight = jnp.sum(normalize(self.alpha[:,None], 0) * weight, axis=0)
         return output * weight
 
-class GemmaRMSNorm(nn.Module):
+class SoupGemmaRMSNorm(nn.Module):
+    num_experts: int
     dim: int
     eps: float=1e-6
     dtype: jnp.dtype=jnp.float32
@@ -343,6 +444,12 @@ class GemmaRMSNorm(nn.Module):
             (self.dim,),
             self.param_dtype,
         )
+        self.alpha = self.param(
+            'alpha', 
+            jax.nn.initializers.constant(1.0), 
+            (self.num_experts,), 
+            self.param_dtype
+        )
 
     def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
         return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
@@ -351,7 +458,68 @@ class GemmaRMSNorm(nn.Module):
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
         weight = jnp.asarray(self.weight, self.dtype)
+        weight = jnp.sum(normalize(self.alpha[:,None], 0) * weight, axis=0)
         return output * (1 + weight)
+
+
+class SoupDense(nn.Module):
+    """A linear transformation applied over the last dimension of the input.
+    """
+    num_experts: int
+    features: int
+    use_bias: bool = True
+    dtype: Optional[Dtype] = None
+    param_dtype: Dtype = jnp.float32
+    precision: PrecisionLike = None
+    kernel_init: Initializer = default_kernel_init
+    bias_init: Initializer = initializers.zeros_init()
+    # Deprecated. Will be removed.
+    dot_general: Optional[DotGeneralT] = None
+    dot_general_cls: Any = None
+
+    @compact
+    def __call__(self, inputs: Array) -> Array:
+        kernel = self.param(
+            'kernel',
+            self.kernel_init,
+            (self.num_experts, jnp.shape(inputs)[-1], self.features),
+            self.param_dtype,
+        )
+        if self.use_bias:
+            bias = self.param(
+            'bias', self.bias_init, (self.num_experts, self.features,), self.param_dtype
+        )
+        else:
+            bias = None
+
+        alpha = self.param(
+            'alpha', 
+            jax.nn.initializers.constant(1.0), 
+            (self.num_experts,), 
+            self.param_dtype
+        )
+
+        inputs, kernel, bias = promote_dtype(inputs, kernel, bias, dtype=self.dtype)
+
+        kernel = jnp.sum(normalize(alpha[:,None,None], 0) * kernel, axis=0)
+
+        if self.dot_general_cls is not None:
+            dot_general = self.dot_general_cls()
+        elif self.dot_general is not None:
+            dot_general = self.dot_general
+        else:
+            dot_general = lax.dot_general
+        y = dot_general(
+            inputs,
+            kernel,
+            (((inputs.ndim - 1,), (0,)), ((), ())),
+            precision=self.precision,
+        )
+        if bias is not None:
+            bias = jnp.sum(normalize(alpha[:,None], 0) * bias, axis=0)
+            y += jnp.reshape(bias, (1,) * (y.ndim - 1) + (-1,))
+        
+        return y
 
 def precompute_freqs_cis(dim: int, end: int, theta: float=10000.0, dtype: jnp.dtype=jnp.float32) -> jnp.ndarray:
     freqs = 1.0 / (theta ** (np.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
@@ -452,7 +620,8 @@ class FlaxSoupLLMAttention(nn.Module):
         self.head_dim = self.embed_dim // self.num_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
-        self.wq = nn.Dense(
+        self.wq = SoupDense(
+            config.expert_size,
             config.num_attention_heads*self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -460,7 +629,8 @@ class FlaxSoupLLMAttention(nn.Module):
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
-        self.wk = nn.Dense(
+        self.wk = SoupDense(
+            config.expert_size,
             config.num_key_value_heads*self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -468,7 +638,8 @@ class FlaxSoupLLMAttention(nn.Module):
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
-        self.wv = nn.Dense(
+        self.wv = SoupDense(
+            config.expert_size,
             config.num_key_value_heads*self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -476,7 +647,8 @@ class FlaxSoupLLMAttention(nn.Module):
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
-        self.wo = nn.Dense(
+        self.wo = SoupDense(
+            config.expert_size,
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -665,7 +837,8 @@ class FlaxSoupLLMMLP(nn.Module):
 
     def setup(self) -> None:
         config = self.config        
-        self.w1 = nn.Dense(
+        self.w1 = SoupDense(
+            config.expert_size,
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -673,7 +846,8 @@ class FlaxSoupLLMMLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
-        self.w2 = nn.Dense(
+        self.w2 = SoupDense(
+            config.expert_size,
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -681,7 +855,8 @@ class FlaxSoupLLMMLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
-        self.w3 = nn.Dense(
+        self.w3 = SoupDense(
+            config.expert_size,
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -708,9 +883,9 @@ class FlaxSoupLLMBlock(nn.Module):
         mlp_module = FlaxSoupLLMMLP
         
         if self.config.norm_module == 'GemmaRMSNorm':
-            norm_module = GemmaRMSNorm
+            norm_module = SoupGemmaRMSNorm
         else:
-            norm_module = RMSNorm
+            norm_module = SoupRMSNorm
         
         if self.config.remat_attention != '':
             attention_module = remat(
@@ -738,12 +913,14 @@ class FlaxSoupLLMBlock(nn.Module):
             precision=self.precision,
         )
         self.attention_norm = norm_module(
+            self.config.expert_size,
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
         self.ffn_norm = norm_module(
+            self.config.expert_size,
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
@@ -1026,13 +1203,14 @@ class FlaxSoupLLMModule(nn.Module):
 
     def setup(self):
         if self.config.norm_module == 'GemmaRMSNorm':
-            norm_module = GemmaRMSNorm
+            norm_module = SoupGemmaRMSNorm
         else:
-            norm_module = RMSNorm
+            norm_module = SoupRMSNorm
         
         self.embed_dim = self.config.hidden_size
-
-        self.wte = nn.Embed(
+        
+        self.wte = SoupEmbed(
+            self.config.expert_size,
             self.config.vocab_size,
             self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -1040,9 +1218,10 @@ class FlaxSoupLLMModule(nn.Module):
             param_dtype=self.param_dtype,
         )
         
+        # self.wte_alpha = self.param('wte_alpha', jax.nn.initializers.constant(1.0), (self.config.expert,), self.param_dtype)
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
         self.h = FlaxSoupLLMBlockCollection(self.config, dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
-        self.ln_f = norm_module(self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype, param_dtype=self.param_dtype)
+        self.ln_f = norm_module(self.config.expert_size, self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype, param_dtype=self.param_dtype)
 
     def __call__(
         self,
@@ -1056,6 +1235,8 @@ class FlaxSoupLLMModule(nn.Module):
         return_dict: bool = True,
     ):
         
+        # the input should replicate with the expert dimensions. 
+        # input_ids = jnp.repeat(input_ids[:,None,:], self.config.expert, 1)
         input_embeds = self.wte(input_ids.astype("i4"))
         hidden_states = self.dropout(input_embeds, deterministic=deterministic)
 
@@ -1113,7 +1294,8 @@ class FlaxSoupLLMForCausalLMModule(nn.Module):
 
     def setup(self):
         self.transformer = FlaxSoupLLMModule(self.config, dtype=self.dtype, param_dtype=self.param_dtype)
-        self.lm_head = nn.Dense(
+        self.lm_head = SoupDense(
+            self.config.expert_size,
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
