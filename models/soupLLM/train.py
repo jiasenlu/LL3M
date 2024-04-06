@@ -32,11 +32,11 @@ from module import metrics as metrics_lib
 import clu
 import clu.metrics as clu_metrics
 
-from models.openLLM.model import OpenLLMConfig, FlaxOpenLLMForCausalLMModule
+from models.soupLLM.model import SoupLLMConfig, FlaxSoupLLMForCausalLMModule
 
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     seed=42,
-    mesh_dim='1,-1,1',
+    mesh_dim='1,-1,1,1',
     dtype='bf16',
     param_dtype='float32',
     total_steps=10000,
@@ -50,12 +50,12 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     save_model_freq=0,
     save_milestone_freq=0,
     eval_steps=0,
-    tokenizer=OpenLLMConfig.get_tokenizer_config(),
+    tokenizer=SoupLLMConfig.get_tokenizer_config(),
     train_dataset=DatasetFactory.get_default_config(),
     eval_dataset=DatasetFactory.get_default_config(),
     optimizer=OptimizerFactory.get_default_config(),
     checkpointer=StreamingCheckpointer.get_default_config(),
-    model=OpenLLMConfig.get_default_config(),
+    model=SoupLLMConfig.get_default_config(),
     logger=mlxu.WandBLogger.get_default_config(),
     log_all_worker=False,
     jax_distributed=JaxDistributedConfig.get_default_config(),
@@ -80,13 +80,13 @@ def main(argv):
     )
     set_random_seed(FLAGS.seed)
 
-    mesh = OpenLLMConfig.get_jax_mesh(FLAGS.mesh_dim)
+    mesh = SoupLLMConfig.get_jax_mesh(FLAGS.mesh_dim)
     tokenizer = get_default_vocabulary()
 
     if FLAGS.load_model_config != '':
-        model_config = OpenLLMConfig.load_config(FLAGS.load_model_config)
+        model_config = SoupLLMConfig.load_config(FLAGS.load_model_config)
     else:
-        model_config = OpenLLMConfig(**FLAGS.model)
+        model_config = SoupLLMConfig(**FLAGS.model)
 
     if FLAGS.update_model_config != '':
         model_config.update(dict(eval(FLAGS.update_model_config)))
@@ -105,7 +105,7 @@ def main(argv):
             FLAGS.train_dataset, tokenizer,
             mesh=mesh, feature_converter_cls=model_config.get_feature_converter)
     else:
-        tokenizer = OpenLLMConfig.get_tokenizer(FLAGS.tokenizer)
+        tokenizer = SoupLLMConfig.get_tokenizer(FLAGS.tokenizer)
         dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
         if FLAGS.load_dataset_state != '':
             dataset.load_state_dict(mlxu.load_pickle(FLAGS.load_dataset_state))
@@ -125,7 +125,7 @@ def main(argv):
     simulated_batch_size = real_batch_size * FLAGS.optimizer.accumulate_gradient_steps
     logging.info(f"Make sure your scheduler steps are based on the simulated batch size: {simulated_batch_size}!")
 
-    model = FlaxOpenLLMForCausalLMModule(
+    model = FlaxSoupLLMForCausalLMModule(
         model_config, 
         dtype=get_float_dtype_by_name(FLAGS.dtype), 
         param_dtype=get_float_dtype_by_name(FLAGS.param_dtype),
@@ -133,8 +133,8 @@ def main(argv):
     
     optimizer, optimizer_info = OptimizerFactory.get_optimizer(
         FLAGS.optimizer,
-        get_weight_decay_mask(OpenLLMConfig.get_weight_decay_exclusions()),
-        get_trainable_params_mask(OpenLLMConfig.get_trainable_params()),
+        get_weight_decay_mask(SoupLLMConfig.get_weight_decay_exclusions()),
+        get_trainable_params_mask(SoupLLMConfig.get_trainable_params()),
     )
 
     def create_trainstate_from_params(params):
@@ -143,16 +143,16 @@ def main(argv):
     def init_fn(rng):
         rng_generator = JaxRNG(rng)
         params = model.init(
-            input_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
-            position_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
-            attention_mask=jnp.ones((4, seq_length), dtype=jnp.int32),
+            input_ids=jnp.zeros((1, seq_length), dtype=jnp.int32),
+            position_ids=jnp.zeros((1, seq_length), dtype=jnp.int32),
+            attention_mask=jnp.ones((1, seq_length), dtype=jnp.int32),
             rngs=rng_generator(model_config.rng_keys()),
         )
         return TrainState.create(params=params, tx=optimizer, apply_fn=None)
 
     def train_step(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
-        batch = with_sharding_constraint(batch, PS('dp', 'fsdp'))
+        batch = with_sharding_constraint(batch, PS(('dp', 'expert'), 'fsdp'))
         
         def loss_and_accuracy(params):
             outputs = model.apply(
@@ -198,7 +198,7 @@ def main(argv):
 
     def eval_step(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
-        batch = with_sharding_constraint(batch, PS('dp', 'fsdp'))
+        batch = with_sharding_constraint(batch, PS(('dp', 'expert'), 'fsdp'))
         logits = model.apply(
             train_state.params, batch['input_tokens'], deterministic=True,
             rngs=rng_generator(model_config.rng_keys()),
@@ -223,7 +223,7 @@ def main(argv):
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
     
     train_state_partition = match_partition_rules(
-        OpenLLMConfig.get_partition_rules(), train_state_shapes
+        SoupLLMConfig.get_partition_rules(), train_state_shapes
     )
     
     shard_fns, gather_fns = make_shard_and_gather_fns(

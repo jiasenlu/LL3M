@@ -1,3 +1,22 @@
+## Different LLM Implementation Overview
+
+In our firt milestone release, we provide the function to convert and finetune [llama2](https://huggingface.co/meta-llama/Llama-2-7b-hf), [mistral](https://huggingface.co/mistralai/Mistral-7B-v0.1), [openLLama](https://huggingface.co/openlm-research/open_llama_3b_v2), [tinyLLama](https://github.com/jzhang38/TinyLlama), [gemma](https://huggingface.co/google/gemma-2b-it), [phi-2](https://huggingface.co/microsoft/phi-2).
+
+The following table shows the difference between the different LLM implementations.
+
+| Model| Tokenizer | vocab_size | #Params|  tie_word_embeddings | has_bias | GQV | norm_module |
+| ---- | ---- | ---- | ---- | --- | --- | --- | --- |
+| llama2 | llama2 | 32000 | 7B | False | False | No | RMSNorm |
+| openLLama | llama2 | 32000 | 3B | False | False | No | RMSNorm |
+| tinyLLama | llama2 | 32000 | 1.3B | False | False | No | RMSNorm |
+| mistral | mistral | 32000 | 7B | False | False | Yes | RMSNorm |
+| gemma | gemma | 2B | 256000 | True | False | Yes | GemmaRMSNorm |
+| phi-2 | phi-2 | 2B | 51200 | True | True | Yes | LayerNorm |
+
+Gemma RMSNorm is a variant of RMSNorm that instead of intialized with 1, it is initialized with 0, and added 1 after normalization.
+
+Phi-2 is very different from other models, The philosophy is to use better data instead of overlook model archetectures. For examples, it has bias for all the layers, which is different from other models. It also does not have MLP layernorm, and use LayerNorm instead.
+
 ## Training or finetuning OpenLLM Model from scratch or existing checkpoints.
 
 We first show a simple way to keep training the LLaMA 2 7B model with wikipediate knowledge. 
@@ -12,7 +31,7 @@ Convert the Official LLaMA Checkpoint to ll3m Format
 
 ``` shell
 python -m models.openLLM.convert_hf_ll3m \
-    --checkpoint_dir='checkpoints/meta-llama/Llama-2-7b-hf' \
+    --checkpoint_dir='checkpoints/meta-llama/Llama-22-7b-hf' \
     --output_file='checkpoints/meta-llama/Llama-2-7b-ll3m' \
     --model='llama2_7b' \
 ```
@@ -73,4 +92,6 @@ To launch on large TPU PODs, run the following commands
 python3 tpu_run.py --tpu YOUR_TPU_NAME --script examples/llama2_7B.sh
 ```
 
+The training log can be find in [here](https://api.wandb.ai/links/jiasenl/ycwul2nr).
 
+The checkpoint and evaluation will upload after 200k steps.
