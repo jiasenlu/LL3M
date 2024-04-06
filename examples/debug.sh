@@ -1,5 +1,4 @@
 . $HOME/.LL3M/bin/activate
-export WANDB_API_KEY="3c1668c7442671a04f67b6024727f53fd2233e12"
 
 # python3 -m models.phi2.train \
 #     --mesh_dim='1,-1,1' \
