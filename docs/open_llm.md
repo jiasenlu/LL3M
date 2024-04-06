@@ -11,7 +11,7 @@ The following table shows the difference between the different LLM implementatio
 | tinyLLama | llama2 | 32000 | 1.3B | False | False | No | RMSNorm |
 | mistral | mistral | 32000 | 7B | False | False | Yes | RMSNorm |
 | gemma | gemma | 2B | 256000 | True | False | Yes | GemmaRMSNorm |
-| phi-2 | phi-2 | 2B | 51200 | True | True | Yes | LayerNorm |
+| phi-2 | phi-2 | 2B | 51200 | False | True | No | LayerNorm |
 
 Gemma RMSNorm is a variant of RMSNorm that instead of intialized with 1, it is initialized with 0, and added 1 after normalization.
 
