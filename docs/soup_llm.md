@@ -16,5 +16,3 @@ python -m models.soupLLM.convert_hf_ll3m \
     --output_file='checkpoints/soupLLM/soup_debug-ll3m' \
     --streaming
 ```
-
-### 
