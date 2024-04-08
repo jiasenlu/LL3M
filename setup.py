@@ -83,6 +83,7 @@ setuptools.setup(
         # Cloud TPU requirements.
         'tpu': [f'jax[tpu] == {_jax_version}'],
         'gpu': [
+            f'jax[cuda12_pip] == {_jax_version}',
             'ipdb==0.13.9',
             'fasttext==0.9.2',
             'pysimdjson==5.0.2',
