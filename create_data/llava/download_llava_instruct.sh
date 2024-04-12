@@ -1,0 +1,2 @@
+mkdir -p datasets/LLaVA-Instruct
+wget https://huggingface.co/datasets/liuhaotian/LLaVA-Instruct-150K/resolve/main/llava_v1_5_mix665k.json?download=true -O datasets/LLaVA-Instruct/llava_v1_5_mix665k.json
