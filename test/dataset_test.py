@@ -71,7 +71,7 @@ def test_multimodal_packing():
 
 def test_multimodal_datasets():
     gin_config = ''
-    gin_bindings = 'data.data_utils.get_default_vocabulary.tokenizer_type = "mistral", data.data_utils.get_default_vocabulary.has_extra_token = True'
+    gin_bindings = 'data.data_utils.get_default_vocabulary.tokenizer_type = "llama", data.data_utils.get_default_vocabulary.has_extra_token = True'
     gin_bindings = gin_bindings.split(',')
     
     gin.parse_config_files_and_bindings(config_files=gin_config, bindings=gin_bindings)
@@ -84,7 +84,7 @@ def test_multimodal_datasets():
         "image_input_idx": 5,
     }
 
-    dataset = seqio.get_mixture_or_task("coco_caption_2017").get_dataset(
+    dataset = seqio.get_mixture_or_task("llava_v1_5_mix665k").get_dataset(
         sequence_length=seq_len,
         split="train",
         num_epochs=1,
@@ -97,7 +97,7 @@ def test_multimodal_datasets():
     converter = MultiModalLMFeatureConverter(pack=False, use_custom_packing_ops=False)
     dataset = converter(dataset, seq_len)
     vocab = get_default_vocabulary()
-    dataset = dataset.batch(8, drop_remainder=True)
+    # dataset = dataset.batch(8, drop_remainder=True)
 
     for i, ex in zip(range(100000), dataset.as_numpy_iterator()):
         # token = ex['decoder_input_tokens'] * np.array(ex['decoder_input_tokens'] != -1, np.int32)

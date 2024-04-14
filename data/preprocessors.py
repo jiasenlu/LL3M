@@ -551,15 +551,14 @@ def image_to_patches_and_tokens(
                   [tf.range(0, tokens_per_image)[None, :], patch_ordering+tokens_per_image], 0)
     else:
         raise NotImplementedError(mode)
-    
+
+    special_token_ids = get_special_token_ids()
+    image_patch_token = special_token_ids[DEFAULT_IMAGE_PATCH_TOKEN]
     if use_img_start_end_token or use_col_tokens:
-      special_token_ids = get_special_token_ids()
-      image_patch_token = special_token_ids[DEFAULT_IMAGE_PATCH_TOKEN]
       image_start_token = special_token_ids[DEFAULT_IM_START_TOKEN]
       image_end_token = special_token_ids[DEFAULT_IM_END_TOKEN]
       image_col_token = special_token_ids[DEFAULT_IM_COL_TOKEN]
-    else:
-      image_patch_token = 0
+
       
     per_row = tf.fill((image_token_length_w*image_layout_impatch_w,), image_patch_token,)
     if use_col_tokens:
@@ -612,7 +611,10 @@ def multimodal_preprocessor(
   image_token_length_h = 12,
   use_col_tokens = True,
   use_img_start_end_token = True,
+  mode = 'patchify-v2-and-resize-c2',
+  max_num_patches = 1,
 ):
+  
   vocab = get_default_vocabulary()
   is_training = sequence_length.get('is_training', True)
 
@@ -628,7 +630,9 @@ def multimodal_preprocessor(
         image_token_length_w=image_token_length_w, 
         image_token_length_h=image_token_length_h, 
         use_col_tokens=use_col_tokens, 
-        use_img_start_end_token=use_img_start_end_token)
+        use_img_start_end_token=use_img_start_end_token, 
+        mode=mode,
+        max_num_patches=max_num_patches)
 
     if prompt_type == "plain-v1":
         prompt_list = tf.constant([
@@ -642,6 +646,7 @@ def multimodal_preprocessor(
         encoded_prefix = tf.concat([vocab.encode_tf(prompt_list[index]), image_tokens], 0)
     elif prompt_type == "null":
         encoded_prefix = image_tokens
+        
     elif prompt_type == "mistral":
         prompt_template = PROPMPT_MANAGER[prompt_type]
         prompt_list = tf.constant(PROMPT_LLAVA_PRETRAIN)
@@ -656,22 +661,63 @@ def multimodal_preprocessor(
             vocab.encode_tf(image_token_string_with_prompt),
             vocab.encode_tf(prompt_template['E_INST']),
         ], 0)
-    elif prompt_type == "llava":
-        import pdb; pdb.set_trace()
+    elif prompt_type == "vicuna_v1":
+        prompt_template = PROPMPT_MANAGER[prompt_type]
+        encoded_prefix = tf.concat([
+            vocab.encode_tf(tf.strings.join([prompt_template['SYS_PREFIX'], prompt_template['B_INST']])),
+            image_tokens,
+        ], 0)
     else:
         prompt_template = PROPMPT_MANAGER[prompt_type]
-        prompt_list = tf.constant(PROMPT_LLAVA_PRETRAIN)
-        index = tf.random.uniform(shape=(), minval=0, maxval=len(prompt_list), dtype=tf.int32)
-        after_image = prompt_template['E_INST']
         encoded_prefix = tf.concat([
             vocab.encode_tf(tf.strings.join([prompt_template['B_INST'], prompt_template['SYS_PREFIX']])),
             image_tokens,
             vocab.encode_tf(prompt_template['E_INST']),
         ], 0)
-
+      
     prefix_loss_weights = tf.zeros(tf.shape(encoded_prefix), tf.int32)
 
     if include_response:
+      if "conversations" in ex:
+        # define the hash table to convert the gpt and user to target format. 
+        keys_tensor = tf.constant([f'human', f'gpt'])
+        vals_tensor = tf.constant([prompt_template['B_INST'], prompt_template['E_INST']])
+        INST_table = tf.lookup.StaticHashTable(
+            tf.lookup.KeyValueTensorInitializer(
+                keys_tensor, 
+                vals_tensor
+            ), 
+            default_value=prompt_template['E_INST']
+        )
+        INST_str = INST_table.lookup(ex['conversations']['from'])
+
+        vals_tensor = tf.constant([prompt_template['SEP'], prompt_template['SEP2']])
+        SEPT_table = tf.lookup.StaticHashTable(
+            tf.lookup.KeyValueTensorInitializer(
+                keys_tensor, 
+                vals_tensor
+            ), 
+            default_value=prompt_template['SEP']
+        )
+        SEPT_str = SEPT_table.lookup(ex['conversations']['from'])
+
+        image_token_strings = vocab.decode_tf(image_tokens) 
+        # dictionary to convert the conversation into prompt.
+        text = tf.concat([tf.reshape(INST_str, [-1,1]), tf.reshape(ex['conversations']['value'], [-1,1]), tf.reshape(SEPT_str, [-1, 1])], axis=1)
+        text = tf.strings.regex_replace(text, '<image>', image_token_strings)
+        encoded_response = vocab.encode_tf(text)
+
+        response_gpt_index = tf.cast(ex['conversations']['from'] == 'gpt', tf.int32)
+        
+        # we need to get the number of token with response_gpt_index and last 2 columns.
+        response_loss_weights = encoded_response * tf.reshape(response_gpt_index, [-1, 1, 1]) * tf.reshape(tf.constant([0, 1, 1]), [1, -1, 1])
+        
+        encoded_response = encoded_response.flat_values
+        response_loss_weights = tf.cast(response_loss_weights.flat_values > 0, tf.int32)
+        targets = tf.concat([encoded_prefix, encoded_response], axis=0)
+        decoder_loss_weights = tf.concat([prefix_loss_weights, response_loss_weights], axis=0)
+        
+      else:
         if len(ex['text'].shape) > 0:
             index = tf.random.uniform(shape=(), minval=0, maxval=tf.shape(ex['text'])[0], dtype=tf.int32)
             text = ex['text'][index]
@@ -683,15 +729,12 @@ def multimodal_preprocessor(
         targets = tf.concat([encoded_prefix, encoded_response], axis=0)
         decoder_loss_weights = tf.concat([prefix_loss_weights, response_loss_weights], axis=0)
     else:
-        # Only the prompt, used for evaluation
-        targets = encoded_prefix
-        decoder_loss_weights = prefix_loss_weights
+      # Only the prompt, used for evaluation
+      targets = encoded_prefix
+      decoder_loss_weights = prefix_loss_weights
     
-    if use_img_start_end_token:
-      image_patch_token = get_special_token_ids()[DEFAULT_IMAGE_PATCH_TOKEN]
-    else:
-      image_patch_token = 0
-      
+    image_patch_token = get_special_token_ids()[DEFAULT_IMAGE_PATCH_TOKEN]
+  
     image_input_idx = targets == image_patch_token
     image_input_idx = tf.experimental.numpy.nonzero(image_input_idx)[0]
 
@@ -732,9 +775,9 @@ def multimodal_preprocessor(
             do_random_scale=False, normalize=False, do_flip_if_vertical=False)[0]
     return out
 
-  if len(ds.element_spec["text"].shape) > 0:
-      if flatten_by_caption:
-          ds = flatten_parts(ds, parts=["text"])
+  if flatten_by_caption:
+    if len(ds.element_spec["text"].shape) > 0:
+      ds = flatten_parts(ds, parts=["text"])
 
   ds = ds.map(to_inputs_and_targets, num_parallel_calls=tf.data.experimental.AUTOTUNE)
   return ds

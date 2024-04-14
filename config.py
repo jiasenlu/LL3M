@@ -61,19 +61,24 @@ PROPMPT_MANAGER['mistral']['B_INST'] = '[INST]'
 PROPMPT_MANAGER['mistral']['E_INST']  = '[/INST]'
 
 
-PROPMPT_MANAGER['llava'] = {}
+PROPMPT_MANAGER['vicuna_v1'] = {}
 
-PROPMPT_MANAGER['llava']['SYS_PROMPT'] =  "You are a helpful language and vision assistant. " + \
-           "You are able to understand the visual content that the user provides, " + \
-           "and assist the user with a variety of tasks using natural language."
+PROPMPT_MANAGER['vicuna_v1']['SYS_PROMPT'] =  "A chat between a curious user and an \
+    artificial intelligence assistant. The assistant gives helpful, detailed, and \
+    polite answers to the user's questions."
 
-PROPMPT_MANAGER['llava']['B_SYS'] = '<<SYS>>\n'
-PROPMPT_MANAGER['llava']['E_SYS'] = '\n<</SYS>>\n\n'
+PROPMPT_MANAGER['vicuna_v1']['B_SYS'] = ''
+PROPMPT_MANAGER['vicuna_v1']['E_SYS'] = ''
 
-PROPMPT_MANAGER['llava']['B_INST'] = '[INST]'
-PROPMPT_MANAGER['llava']['E_INST']  = '[/INST]'
+PROPMPT_MANAGER['vicuna_v1']['B_INST'] = 'USER: '
+PROPMPT_MANAGER['vicuna_v1']['E_INST'] = 'ASSISTANT: '
 
-PROPMPT_MANAGER['llava']['SYS_PREFIX'] = PROPMPT_MANAGER['llava']['B_SYS'] + \
-                                        PROPMPT_MANAGER['llava']['SYS_PROMPT'] + \
-                                        PROPMPT_MANAGER['llava']['E_SYS']
+PROPMPT_MANAGER['vicuna_v1']['SEP']  = ' '
+PROPMPT_MANAGER['vicuna_v1']['SEP2']  = '</s>'
+
+
+
+PROPMPT_MANAGER['vicuna_v1']['SYS_PREFIX'] = PROPMPT_MANAGER['vicuna_v1']['B_SYS'] + \
+                                        PROPMPT_MANAGER['vicuna_v1']['SYS_PROMPT'] + \
+                                        PROPMPT_MANAGER['vicuna_v1']['E_SYS']
                                         

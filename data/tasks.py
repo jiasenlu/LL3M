@@ -198,3 +198,30 @@ TaskRegistry.add(
   ],
   output_features=MULTIMODAL_OUTPUT_FEATURES,
 )
+
+TaskRegistry.add(
+  "llava_v1_5_mix665k",
+  source=seqio.TfdsDataSource(
+    tfds_name="llava_insturct_mix665k:1.0.0",
+    tfds_data_dir="gs://mm-olmo/datasets/",
+  ),
+  preprocessors=[
+    functools.partial(
+      rekey, key_map={
+        "image": ["image"],
+        "conversations": ["conversations"],
+        "has_image": ["has_image"],
+      }),
+    functools.partial(
+      multimodal_preprocessor,
+      prompt_type="vicuna_v1",
+      use_img_start_end_token=False,
+      use_col_tokens=False,
+      image_token_length_w=24,
+      image_token_length_h=24,
+      max_num_patches=1,
+      mode='resize',
+    ),
+  ],
+  output_features=MULTIMODAL_OUTPUT_FEATURES,
+)
