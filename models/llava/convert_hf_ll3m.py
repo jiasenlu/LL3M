@@ -28,7 +28,7 @@ OPENLLM_STANDARD_CONFIGS = {
         "vocab_size": 32016,
         "dim": 4096,
         "intermediate_size": 14336,
-        "n_layers": 2,
+        "n_layers": 32,
         "n_heads": 32,
         "norm_eps": 1e-5,
         "max_position_embeddings": 4096,
@@ -39,10 +39,10 @@ OPENLLM_STANDARD_CONFIGS = {
         "mm_hidden_size": 1024,  
     },
     "llava-v1.5-vicuna-7b": {
-        "vocab_size": 32016,
+        "vocab_size": 32000,
         "dim": 4096,
         "intermediate_size": 14336,
-        "n_layers": 2,
+        "n_layers": 32,
         "n_heads": 32,
         "norm_eps": 1e-5,
         "max_position_embeddings": 4096,
@@ -146,8 +146,6 @@ def main(args):
                     k = k[13:]
                     vit_ckpt[k] = v
                     
-        import pdb; pdb.set_trace()
-
     else:
         ckpt_paths = sorted(Path(args.checkpoint_dir).glob("*.bin"))
         ckpt = {}

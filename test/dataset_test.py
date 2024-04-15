@@ -122,7 +122,7 @@ def test_nlp_datasets():
     )
 
     vocab = get_default_vocabulary('gemma')
-
+    
     converter = LMFeatureConverter(pack=False, use_custom_packing_ops=False, bos_id=vocab.bos_token_id)
     dataset = converter(dataset, seq_len)
     for i, ex in zip(range(100000), dataset.as_numpy_iterator()): 

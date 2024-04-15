@@ -167,7 +167,7 @@ class MLP(nn.Module):
             use_bias=True,
             name='w1',
         )(x)
-        x = jax.nn.gelu(x, approximate=False)
+        x = QuickGELU(x)
         x = with_sharding_constraint(x, ('batch', 'length', 'mlp'))
         x = nn.Dense(
             cfg.image_emb_dim,
@@ -469,6 +469,7 @@ class VisionTransformer(nn.Module):
         x = x[:,1:,:]
         x = x * mask
         x = jnp.reshape(x, [B, T, N, -1])
+        
         return x
 
 

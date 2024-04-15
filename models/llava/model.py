@@ -50,7 +50,7 @@ LLAVA_STANDARD_CONFIGS = {
         'vocab_size': 32000,
         'hidden_size': 4096,
         'intermediate_size': 11008,
-        'num_hidden_layers': 2,
+        'num_hidden_layers': 32,
         'num_attention_heads': 32,
         'num_key_value_heads': 32,
         'max_sequence_length': 4096,
@@ -134,7 +134,7 @@ class LlavaConfig(PretrainedConfig):
 
     def __init__(
         self,
-        additional_vocab_size=128,
+        additional_vocab_size=0,
         use_cache=True,
         # pad_token_id=-1,
         bos_token_id=0,
@@ -287,9 +287,6 @@ class LlavaConfig(PretrainedConfig):
             raise ValueError(f'Unsupported load config type: {load_type}')
 
 remat = nn_partitioning.remat
-
-
-def QuickGELU(x): return x * nn.sigmoid(1.702 * x)
     
 class MLP(nn.Module):
     mlp_dims: DType = int
@@ -481,7 +478,7 @@ class FlaxLlavaModule(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]]=None
 
     def setup(self):
-        
+        self.total_vocab_size = self.config.vocab_size + self.config.additional_vocab_size
         self.image_vit = VisionTransformer(self.config, name='image_vit')
         mlp_module = MLP
         
@@ -494,7 +491,7 @@ class FlaxLlavaModule(nn.Module):
         
         self.embed_dim = self.config.hidden_size
         self.wte = nn.Embed(
-            self.config.vocab_size + self.config.additional_vocab_size,
+            self.total_vocab_size,
             self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             dtype=self.dtype,
@@ -518,9 +515,38 @@ class FlaxLlavaModule(nn.Module):
         return_dict: bool = True,
         decoding_with_cache: Optional[bool] = None
     ):
+
         batch_size, seq_length = input_ids.shape
+
+        # import pickle
+        # # pickle.dump({'input_ids':input_ids, 'images':images, 'image_input_idx':image_input_idx}, open('save.pkl', 'wb'))
+        # aa = pickle.load(open('input.pkl', 'rb'))
+        # input_ids = aa['input_ids']
+        # pixel_values = aa['pixel_values']
+        # pixel_values = np.transpose(pixel_values, (0,2,3,1))
+        # images = einops.rearrange(
+        #     pixel_values, 'b (dy h dh) (dx w dw) c -> b (dy dx) (h w) (dh dw c)',
+        #     dh=14,
+        #     dw=14,
+        #     dy=1,
+        #     dx=1,
+        #     h=24,
+        #     w=24
+        # )
+        # images = jnp.repeat(images, batch_size, 0) 
+        # input_ids = jnp.repeat(input_ids, batch_size, 0)
+        
+        # attention_mask = jnp.ones(input_ids.shape, jnp.int32)
+        # position_ids = jnp.zeros(input_ids.shape, jnp.int32)
+        
+        oov_ids = (input_ids < self.total_vocab_size) & (input_ids > 0)
+        # replace the oov token with 0.
+        input_ids = input_ids * oov_ids
+        
         input_embeds = self.wte(input_ids.astype("i4"))        
         
+        # further filter with 0 embeddings. 
+        input_embeds = input_embeds * oov_ids[:,:,None]
         
         if images is not None and not decoding_with_cache:  
             _, num_image, num_patch, _ = images.shape
@@ -536,7 +562,7 @@ class FlaxLlavaModule(nn.Module):
             image_input_idx = jnp.reshape(image_input_idx, (batch_size, num_image*num_patch))
         
             input_embeds = input_embeds.at[jnp.arange(batch_size)[:, None], image_input_idx].add(image_features)
-            
+        
         hidden_states = self.dropout(input_embeds, deterministic=deterministic)
 
         outputs = self.h(
