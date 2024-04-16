@@ -3,111 +3,57 @@ From:
 '''
 
 import os
-import dataclasses
-from typing import Any, Dict, List, Optional, Tuple, Union, Callable, Sequence, Iterable
+from shutil import copyfile
+from typing import Any, Dict, List, Optional, Tuple, Union, Sequence, Callable
 import json
 import tempfile
 from functools import partial
-from absl import logging
+import absl
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.sharding import PartitionSpec as PS
+from jax import random
+
+import flax
 import flax.linen as nn
+from flax.linen import initializers
+from flax.linen.dtypes import promote_dtype
+from flax.linen.module import compact
+
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
+from flax.linen import combine_masks, make_causal_mask
+from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
 from flax.linen import partitioning as nn_partitioning
-from flax.linen.dtypes import promote_dtype
 import einops
 
 import sentencepiece as spm
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
-from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel
-from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward
+from transformers.utils import logging
+from transformers.tokenization_utils import PreTrainedTokenizer
+from transformers.file_utils import ModelOutput
+from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel, append_call_sample_docstring
+from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging
 
 from ml_collections import ConfigDict
 from ml_collections.config_dict import config_dict
 from mlxu import function_args_to_config, load_pickle, open_file
 
+from data.data_utils import MultiModalLMFeatureConverter
 from data.transformer_tokenizer import LLaMATokenizer
+from module.bpt import blockwise_ffn, blockwise_attn
 from module.jax_utils import (
-    with_sharding_constraint, get_jax_mesh
+    with_sharding_constraint, get_gradient_checkpoint_policy, get_jax_mesh
 )
 
-from models.openLLM.model import FlaxOpenLLMBlockCollection, RMSNorm, FlaxOpenLLMMLP
+from flax.typing import Dtype, PrecisionLike, DotGeneralT
 from models.llava.vit import VisionTransformer, MultiHeadDotProductAttention, VIT_STANDARD_CONFIGS
+from models.llava.model import MLP
+from models.soupLLM.model import SoupGemmaRMSNorm, SoupRMSNorm, SoupEmbed, FlaxSoupLLMBlockCollection, FlaxBaseModelOutput, SoupDense
 
-Array = jnp.ndarray
-DType = jnp.dtype
-PRNGKey = jnp.ndarray
-Shape = Iterable[int]
-
-LLAVA_STANDARD_CONFIGS = {
-    "llava-v1.5-vicuna-7b": {
-        'vocab_size': 32000,
-        'hidden_size': 4096,
-        'intermediate_size': 11008,
-        'num_hidden_layers': 2,
-        'num_attention_heads': 32,
-        'num_key_value_heads': 32,
-        'max_sequence_length': 4096,
-        'max_position_embeddings': 8192,
-        'rope_theta': 10000.0, 
-        'initializer_range': 0.02,
-        'rms_norm_eps': 1e-5,
-        'use_cache': True,
-        'tie_word_embeddings': False,
-        'hidden_act': 'silu', 
-        'z_loss': 0.001,
-        'norm_module': 'RMSNorm',
-        "mm_vision_tower": "ViT-L/14-336",
-    },
-    "llava-v1.6-vicuna-7b": {
-        'vocab_size': 32000,
-        'hidden_size': 4096,
-        'intermediate_size': 11008,
-        'num_hidden_layers': 2,
-        'num_attention_heads': 32,
-        'num_key_value_heads': 32,
-        'max_sequence_length': 4096,
-        'max_position_embeddings': 8192,
-        'rope_theta': 10000.0, 
-        'initializer_range': 0.02,
-        'rms_norm_eps': 1e-5,
-        'use_cache': True,
-        'tie_word_embeddings': False,
-        'hidden_act': 'silu', 
-        'z_loss': 0.001,
-        'norm_module': 'RMSNorm',
-        "mm_vision_tower": "ViT-L/14-336",
-    },
-    "llava-v1.6-vicuna-7b-flash": {
-        'vocab_size': 32000,
-        'hidden_size': 4096,
-        'intermediate_size': 11008,
-        'num_hidden_layers': 32,
-        'num_attention_heads': 32,
-        'num_key_value_heads': 32,
-        'max_sequence_length': 4096,
-        'max_position_embeddings': 8192,
-        'rope_theta': 10000.0, 
-        'initializer_range': 0.02,
-        'rms_norm_eps': 1e-5,
-        'use_cache': True,
-        'tie_word_embeddings': False,
-        'hidden_act': 'silu', 
-        'z_loss': 0.001,
-        'norm_module': 'RMSNorm',
-        "mm_vision_tower": "ViT-L/14-336",
-        'scan_attention': True,
-        'scan_mlp': True,
-    },
-}
-
-# Type annotations
 Array = jnp.ndarray
 DType = jnp.dtype
 PRNGKey = jnp.ndarray
@@ -115,26 +61,136 @@ Shape = Sequence[int]
 Activation = Callable[..., Array]
 # Parameter initializers.
 Initializer = Callable[[PRNGKey, Shape, DType], Array]
+default_kernel_init = initializers.lecun_normal()
 
-default_embed_init = nn.initializers.variance_scaling(
-    1.0, 'fan_in', 'normal', out_axis=0)
+HIDDEN_ACT_MAPPING = {'silu': nn.silu, 'gelu': nn.gelu}
 
-class LlavaConfig(PretrainedConfig):
+OPEN_LLM_STANDARD_CONFIGS = {
+    'llama-llava-v1.5-7b': {
+        'vocab_size': 32000,
+        'hidden_size': 4096,
+        'intermediate_size': 11008,
+        'num_hidden_layers': 2,
+        'num_attention_heads': 32,
+        'num_key_value_heads': 32,
+        'max_sequence_length': 4096,
+        'max_position_embeddings': 8192,
+        'rope_theta': 10000.0, 
+        'initializer_range': 0.02,
+        'rms_norm_eps': 1e-5,
+        'use_cache': True,
+        'tie_word_embeddings': False,
+        'hidden_act': 'silu', 
+        'z_loss': 0.001,
+        'norm_module': 'RMSNorm',
+        'expert_size': 4, 
+        "mm_vision_tower": "ViT-L/14-336",
+    },
+    
+    'debug': { # A small model for debugging
+        'vocab_size': 32000,
+        'hidden_size': 512,
+        'intermediate_size': 512,
+        'num_hidden_layers': 2,
+        'num_attention_heads': 8,
+        'max_sequence_length': 4096,
+        'initializer_range': 0.02,
+        'rms_norm_eps': 1e-5,
+        'max_position_embeddings': 4096,
+        'num_key_value_heads': 8,
+        'rope_theta': 10000.0, 
+        'use_cache': True,
+        'tie_word_embeddings': False,
+        'z_loss': 0.001,
+        'hidden_act': 'silu', 
+        'norm_module': 'RMSNorm',
+        "mm_vision_tower": "ViT-L/14-336",
+    },
+}
+
+@flax.struct.dataclass
+class FlaxMaskedLMOutput(ModelOutput):
+    """
+    Base class for masked language models outputs.
+
+    Args:
+        logits (:obj:`jnp.ndarray` of shape :obj:`(batch_size, sequence_length, config.vocab_size)`):
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        hidden_states (:obj:`tuple(jnp.ndarray)`, `optional`, returned when ``output_hidden_states=True`` is passed or when ``config.output_hidden_states=True``):
+            Tuple of :obj:`jnp.ndarray` (one for the output of the embeddings + one for the output of each layer) of
+            shape :obj:`(batch_size, sequence_length, hidden_size)`.
+
+            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
+        attentions (:obj:`tuple(jnp.ndarray)`, `optional`, returned when ``output_attentions=True`` is passed or when ``config.output_attentions=True``):
+            Tuple of :obj:`jnp.ndarray` (one for each layer) of shape :obj:`(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+    """
+
+    logits: jnp.ndarray = None
+    hidden_states: Optional[Tuple[jnp.ndarray]] = None
+    attentions: Optional[Tuple[jnp.ndarray]] = None
+    
+FlaxCausalLMOutput = FlaxMaskedLMOutput
+
+class SoupLMMConfig(PretrainedConfig):
     r"""
+    This is the configuration class to store the configuration of a [`~LLaMAModel`]. It is used to instantiate an LLaMA
+    model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
+    defaults will yield a similar configuration to that of the LLaMA-7B.
+    Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
+    documentation from [`PretrainedConfig`] for more information.
+    Args:
+        vocab_size (`int`, *optional*, defaults to 32000):
+            Vocabulary size of the LLaMA model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed when calling [`~LLaMAModel`] or [`~TFLLaMAModel`].
+        hidden_size (`int`, *optional*, defaults to 4096):
+            Dimension of the hidden representations.
+        intermediate_size (`int`, *optional*, defaults to 11008):
+            Dimension of the MLP representations.
+        num_hidden_layers (`int`, *optional*, defaults to 32):
+            Number of hidden layers in the Transformer encoder.
+        num_attention_heads (`int`, *optional*, defaults to 32):
+            Number of attention heads for each attention layer in the Transformer encoder.
+        hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
+            The non-linear activation function (function or string) in the decoder.
+        max_sequence_length (`int`, *optional*, defaults to 2048):
+            Max sequence length for model (for RoPE computation)
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-12):
+            The epsilon used by the rms normalization layers.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether or not the model should return the last key/values attentions (not used by all models). Only
+            relevant if `config.is_decoder=True`.
+        tie_word_embeddings(`bool`, *optional*, defaults to `False`):
+            Whether to tie weight embeddings
+        Example:
     ```python
-    >>> from transformers import LLaMAModel, LlavaConfig
+    >>> from transformers import LLaMAModel, LLaMAConfig
     >>> # Initializing a LLaMA llama-7b style configuration
-    >>> configuration = LlavaConfig()
+    >>> configuration = LLaMAConfig()
     >>> # Initializing a model from the llama-7b style configuration
     >>> model = LLaMAModel(configuration)
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```"""
-    model_type = "llava"
+    model_type = "llama"
 
     def __init__(
         self,
+        vocab_size=32000,
         additional_vocab_size=0,
+        hidden_size=4096,
+        intermediate_size=11008,
+        num_hidden_layers=32,
+        num_attention_heads=32,
+        num_key_value_heads=32,
+        max_sequence_length=2048,
+        rms_norm_eps=1e-5,
+        initializer_range=0.02,
         use_cache=True,
         # pad_token_id=-1,
         bos_token_id=0,
@@ -154,9 +210,19 @@ class LlavaConfig(PretrainedConfig):
         fcm_min_ratio=0.0,
         fcm_max_ratio=0.0,
         normalize_input_embeds=False,
+        norm_module='RMSNorm',
+        hidden_act='silu',
         **kwargs,
     ):
+        self.vocab_size = vocab_size
         self.additional_vocab_size = additional_vocab_size
+        self.hidden_size = hidden_size
+        self.initializer_range = initializer_range
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.max_sequence_length = max_sequence_length
+        self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.resid_pdrop = resid_pdrop
         self.embd_pdrop = embd_pdrop
@@ -172,13 +238,21 @@ class LlavaConfig(PretrainedConfig):
         self.fcm_min_ratio = fcm_min_ratio
         self.fcm_max_ratio = fcm_max_ratio
         self.normalize_input_embeds = normalize_input_embeds
-
+        self.norm_module = norm_module
+        self.hidden_act = hidden_act
+        self.num_key_value_heads = num_key_value_heads
         super().__init__(
             # pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
+        )
+
+    def get_feature_converter(self, **kwargs):
+        return MultiModalLMFeatureConverter(
+            bos_id=self.bos_token_id,
+            **kwargs
         )
 
     @classmethod
@@ -189,10 +263,10 @@ class LlavaConfig(PretrainedConfig):
             config.update(ConfigDict(updates).copy_and_resolve_references())
 
         return config
-    
+
     @staticmethod
     def get_jax_mesh(axis_dims):
-        return get_jax_mesh(axis_dims, ('dp', 'fsdp', 'mp'))
+        return get_jax_mesh(axis_dims, ('dp', 'expert', 'fsdp', 'mp'))
     
     @staticmethod
     def get_partition_rules():
@@ -202,7 +276,8 @@ class LlavaConfig(PretrainedConfig):
             None as a pytree leaf.
         """
         return (
-            # vision part:
+
+            # vision part: 
             ("patch_embedding/kernel", PS("mp", "fsdp")),
                      
             ("attention/(wq|wk|wv)/bias", PS("mp",)),
@@ -213,24 +288,26 @@ class LlavaConfig(PretrainedConfig):
             
             ("mm_projector/w1/kernel", PS("fsdp", "mp")),
             ("mm_projector/w2/kernel", PS("mp", "fsdp")),
-
+            
             # embeddings
-            ("transformer/wte/embedding", PS("mp", "fsdp")),
-            # ("transformer/wte/new_embedding", PS("mp", "fsdp")),
+            ("transformer/wte/embedding", PS("expert", "mp", "fsdp")),
             # atention
-            ("attention/(wq|wk|wv)/kernel", PS("fsdp", "mp")),
-            ("attention/wo/kernel", PS("mp", "fsdp")),
+            ("attention/(wq|wk|wv)/kernel", PS("expert", "fsdp", "mp")),
+            ("attention/wo/kernel", PS("expert", "mp", "fsdp")),
             # mlp
-            ("feed_forward/w1/kernel", PS("fsdp", "mp")),
-            ("feed_forward/w2/kernel", PS("mp", "fsdp")),
-            ("feed_forward/w3/kernel", PS("fsdp", "mp")),
-            # layer norms
-            ("attention_norm/kernel", PS(None)),
-            ("ffn_norm/kernel", PS(None)),
+            ("feed_forward/w1/kernel", PS("expert", "fsdp", "mp")),
+            ("feed_forward/w2/kernel", PS("expert", "mp", "fsdp")),
+            ("feed_forward/w3/kernel", PS("expert", "fsdp", "mp")),
+            # layer normss
+            ("attention_norm/kernel", PS("expert", None)),
+            ("ffn_norm/kernel", PS("expert", None)),
             # output head
-            ("transformer/ln_f/kernel", PS(None)),
-            ("lm_head/kernel", PS("fsdp", "mp")),
-            ('.*', PS(None)),
+            ("transformer/ln_f/kernel", PS("expert", None)),
+            ("lm_head/kernel", PS("expert", "fsdp", "mp")),
+            # alpha            
+            (".alpha", PS("expert",)),
+
+            ('.*', PS("expert", None)),
         )
 
     @staticmethod
@@ -239,8 +316,18 @@ class LlavaConfig(PretrainedConfig):
 
     @staticmethod
     def get_trainable_params():
-        return tuple(['mm_projector', 'transformer/wte/new_embedding'])
-        # return tuple([r'^.*'])
+        return tuple(
+            [
+                "transformer/wte/embedding", 
+                "attention/(wq|wk|wv|wo)/kernel",
+                "feed_forward/(w1|w2|w3)/kernel",
+                "attention_norm/kernel",
+                "ffn_norm/kernel",
+                "transformer/ln_f/kernel",
+                "lm_head/kernel",
+                "mm_projector",
+            ]
+        )
 
     @staticmethod
     def rng_keys():
@@ -249,7 +336,7 @@ class LlavaConfig(PretrainedConfig):
     @staticmethod
     def get_tokenizer_config(updates=None):
         config = ConfigDict()
-        config.vocab_file = 'data/tokenizer.model'
+        config.vocab_file = 'data/tokenizer_llama.model'
         config.add_bos_token = False
         config.add_eos_token = False
 
@@ -272,9 +359,8 @@ class LlavaConfig(PretrainedConfig):
 
     @classmethod
     def load_config(cls, path):
-        if path in LLAVA_STANDARD_CONFIGS:
-            config = LLAVA_STANDARD_CONFIGS[path]
-            return cls.from_dict(config | VIT_STANDARD_CONFIGS[config['mm_vision_tower']])
+        if path in OPEN_LLM_STANDARD_CONFIGS:
+            return cls.from_dict(OPEN_LLM_STANDARD_CONFIGS[path])
         load_type, load_path = path.split('::', 1)
         if load_type == 'pickle':
             return cls.from_dict(load_pickle(load_path)['llama_config'])
@@ -285,46 +371,29 @@ class LlavaConfig(PretrainedConfig):
         else:
             raise ValueError(f'Unsupported load config type: {load_type}')
 
-remat = nn_partitioning.remat
-    
-class MLP(nn.Module):
-    mlp_dims: DType = int
-    out_dims: DType = int
-    dtype: DType = jnp.float32
-    param_dtype: DType = jnp.float32
-    
-    @nn.compact
-    def __call__(self, x, deterministic=True):
-        x = nn.Dense(
-            self.mlp_dims,
-            dtype=self.dtype,
-            use_bias=True,
-            name='w1',
-        )(x)
-        x = jax.nn.gelu(x, approximate=False)
-        x = with_sharding_constraint(x, ('batch', 'length', 'mlp'))
-        x = nn.Dense(
-            self.out_dims,
-            dtype=self.dtype,
-            use_bias=True,
-            name='w2',
-        )(x)
 
-        return x
-    
-class FlaxLlavaPreTrainedModel(FlaxPreTrainedModel):
+remat = nn_partitioning.remat
+
+logger = logging.get_logger(__name__)
+
+default_embed_init = initializers.variance_scaling(
+  1.0, 'fan_in', 'normal', out_axis=0
+)
+
+
+class FlaxSoupLMMPreTrainedModel(FlaxPreTrainedModel):
     """
     An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
     models.
     """
 
-    config_class = LlavaConfig
+    config_class = SoupLMMConfig
     base_model_prefix = "transformer"
     module_class: nn.Module = None
 
     def __init__(
         self,
-        config: LlavaConfig,
+        config: SoupLMMConfig,
         input_shape: Tuple = (1, 1),
         seed: int = 0,
         dtype: jnp.dtype = jnp.float32,
@@ -341,7 +410,7 @@ class FlaxLlavaPreTrainedModel(FlaxPreTrainedModel):
         position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape)
         params_rng, dropout_rng = jax.random.split(rng)
         rngs = {"params": params_rng, "dropout": dropout_rng}
-        
+
         if self.config.add_cross_attention:
             encoder_hidden_states = jnp.zeros(input_shape + (self.config.hidden_size,))
             encoder_attention_mask = attention_mask
@@ -394,8 +463,6 @@ class FlaxLlavaPreTrainedModel(FlaxPreTrainedModel):
         input_ids,
         attention_mask=None,
         position_ids=None,
-        images=None,
-        image_input_idx=None,
         params: dict = None,
         past_key_values: dict = None,
         dropout_rng: jax.random.PRNGKey = None,
@@ -403,9 +470,6 @@ class FlaxLlavaPreTrainedModel(FlaxPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        decoding_with_cache: Optional[bool] = None,
-        append_last_valid_logits: bool=None,
-
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -438,25 +502,18 @@ class FlaxLlavaPreTrainedModel(FlaxPreTrainedModel):
         else:
             mutable = False
 
-        extra_args = dict()
-        if images is not None:
-            extra_args["images"] = images
-            extra_args["image_input_idx"] = image_input_idx
-
         outputs = self.module.apply(
             inputs,
             jnp.array(input_ids, dtype="i4"),
-            jnp.array(attention_mask, dtype="i4"),
+            jnp.array(attention_mask, dtype="i4"), 
             jnp.array(position_ids, dtype="i4"),
-            deterministic=not train,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            not train,
+            False,
+            output_attentions,
+            output_hidden_states,
+            return_dict,
             rngs=rngs,
             mutable=mutable,
-            decoding_with_cache=decoding_with_cache is not None,
-            append_last_valid_logits=append_last_valid_logits,
-            **extra_args
         )
 
         # add updated cache to model output
@@ -469,14 +526,21 @@ class FlaxLlavaPreTrainedModel(FlaxPreTrainedModel):
             outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
 
         return outputs
-
-class FlaxLlavaModule(nn.Module):
-    config: LlavaConfig
+    
+class FlaxSoupLMMModule(nn.Module):
+    config: SoupLMMConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype=jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]]=None
 
     def setup(self):
+        if self.config.norm_module == 'GemmaRMSNorm':
+            norm_module = SoupGemmaRMSNorm
+        else:
+            norm_module = SoupRMSNorm
+        
+        self.embed_dim = self.config.hidden_size
+
         self.total_vocab_size = self.config.vocab_size + self.config.additional_vocab_size
         self.image_vit = VisionTransformer(self.config, name='image_vit')
         mlp_module = MLP
@@ -488,17 +552,19 @@ class FlaxLlavaModule(nn.Module):
             param_dtype=self.param_dtype,
         )
         
-        self.embed_dim = self.config.hidden_size
-        self.wte = nn.Embed(
+        self.wte = SoupEmbed(
+            self.config.expert_size,
             self.total_vocab_size,
             self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
+        
+        # self.wte_alpha = self.param('wte_alpha', jax.nn.initializers.constant(1.0), (self.config.expert,), self.param_dtype)
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
-        self.h = FlaxOpenLLMBlockCollection(self.config, dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
-        self.ln_f = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype, param_dtype=self.param_dtype)
+        self.h = FlaxSoupLLMBlockCollection(self.config, dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
+        self.ln_f = norm_module(self.config.expert_size, self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype, param_dtype=self.param_dtype)
 
     def __call__(
         self,
@@ -506,7 +572,7 @@ class FlaxLlavaModule(nn.Module):
         attention_mask,
         position_ids,
         images,
-        image_input_idx,    
+        image_input_idx,
         deterministic=True,
         init_cache: bool = False,
         output_attentions: bool = False,
@@ -541,8 +607,11 @@ class FlaxLlavaModule(nn.Module):
         
             input_embeds = input_embeds.at[jnp.arange(batch_size)[:, None], image_input_idx].add(image_features)
 
-
         hidden_states = self.dropout(input_embeds, deterministic=deterministic)
+
+        # normalized
+        if self.config.normalize_input_embeds:
+            hidden_states = hidden_states * (self.config.hidden_size**0.5)
 
         outputs = self.h(
             hidden_states,
@@ -556,6 +625,7 @@ class FlaxLlavaModule(nn.Module):
         )
 
         hidden_states = outputs[0]
+        
         hidden_states = self.ln_f(hidden_states)
 
         if output_hidden_states:
@@ -574,19 +644,19 @@ class FlaxLlavaModule(nn.Module):
         )
 
 @add_start_docstrings("", "")
-class FlaxLlavaModel(FlaxLlavaPreTrainedModel):
-    module_class = FlaxLlavaModule
+class FlaxSoupLMMMAModel(FlaxSoupLMMPreTrainedModel):
+    module_class = FlaxSoupLMMModule
 
-class FlaxLlavaForCausalLMModule(nn.Module):
-    config: LlavaConfig
+class FlaxSoupLMMForCausalLMModule(nn.Module):
+    config: SoupLMMConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype=jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]]=None
+    precision: Union[jax.lax.Precision, str]=jax.lax.Precision.HIGHEST
 
     def setup(self):
-        self.transformer = FlaxLlavaModule(self.config, dtype=self.dtype)
-
-        self.lm_head = nn.Dense(
+        self.transformer = FlaxSoupLMMModule(self.config, dtype=self.dtype, param_dtype=self.param_dtype)
+        self.lm_head = SoupDense(
+            self.config.expert_size,
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -613,6 +683,7 @@ class FlaxLlavaForCausalLMModule(nn.Module):
     ):
         
         batch_size, seq_length = input_ids.shape
+        
         if attention_mask is None:
             attention_mask = jnp.ones_like(input_ids)
         if position_ids is None:
@@ -640,45 +711,17 @@ class FlaxLlavaForCausalLMModule(nn.Module):
         else:
             lm_logits = self.lm_head(hidden_states)
 
-        if append_last_valid_logits is not None:
-            logging.info("Append logits")
-            last_valid_logit = lm_logits[jnp.arange(lm_logits.shape[0]), append_last_valid_logits]
-            lm_logits = jnp.concatenate([lm_logits[:, :-1], last_valid_logit[:, None]], axis=1)
-            
         if not return_dict:
             return (lm_logits,) + outputs[1:]
 
-        return FlaxCausalLMOutput(logits=lm_logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions)
+        return FlaxCausalLMOutput(logits=lm_logits,hidden_states=outputs.hidden_states, attentions=outputs.attentions)
+
 
 @add_start_docstrings("", "")
-class FlaxLlavaForCausalLM(FlaxLlavaPreTrainedModel):
-    module_class = FlaxLlavaForCausalLMModule
+class FlaxSoupLMMForCausalLM(FlaxSoupLMMPreTrainedModel):
+    module_class = FlaxSoupLMMForCausalLMModule
 
-    def prepare_inputs_for_generation(
-        self, input_ids, max_length,
-        images=None, image_input_idx=None,
-        attention_mask: Optional[jax.Array] = None):
-
-        if attention_mask is None:
-            attention_mask = (input_ids != -1).astype(jnp.int32)
-
-        # This would shift from left padding to right padding, which is what we want for inference,
-        # but doing that seems to break the LLM even though it shouldn't in theory....
-        # if attention_mask is not None:
-            # bs, seq_len = attention_mask.shape
-            # n_to_shift = jnp.sum(attention_mask == 0, axis=1)
-            # # n_to_shift = n_to_shift * jnp.array([1]+[0]*7, dtype=n_to_shift.dtype)
-            # if images is not None:
-            #     image_input_idx = image_input_idx + n_to_shift[:, None, None]
-            #
-            # def _shift_right(_val):
-            #     shifted = []
-            #     for i in range(bs):
-            #         shifted.append(jnp.roll(_val[i], n_to_shift[i]))
-            #     return jnp.stack(shifted, 0)
-            # input_ids = _shift_right(input_ids)
-            # attention_mask = _shift_right(attention_mask)
-        #
+    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
         # initializing the cache
         batch_size, seq_length = input_ids.shape
 
@@ -688,30 +731,18 @@ class FlaxLlavaForCausalLM(FlaxLlavaPreTrainedModel):
         # Thus we can create a single static attention_mask here, which is more efficient for compilation
         extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
         if attention_mask is not None:
-            # Max so right padding tokens have a valid position id
-            position_ids = jnp.maximum(attention_mask.cumsum(axis=-1) - 1, 0)
+            position_ids = attention_mask.cumsum(axis=-1) - 1
             extended_attention_mask = lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
         else:
             position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length))
 
-        out = {
+        return {
             "past_key_values": past_key_values,
             "attention_mask": extended_attention_mask,
             "position_ids": position_ids,
-            "append_last_valid_logits": attention_mask.sum(axis=-1) - 1
         }
-        if images is not None:
-            out["images"] = images
-            out["image_input_idx"] = image_input_idx
-        return out
 
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
         model_kwargs["past_key_values"] = model_outputs.past_key_values
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
-        model_kwargs["decoding_with_cache"] = True
-        if "append_last_valid_logits" in model_kwargs:
-            del model_kwargs["append_last_valid_logits"]
-        if "images" in model_kwargs:
-            del model_kwargs["images"]
-            del model_kwargs["image_input_idx"]
         return model_kwargs

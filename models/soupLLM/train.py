@@ -65,8 +65,15 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
 
 def main(argv):
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
-    if FLAGS.gin_config == '': FLAGS.gin_config = None
-    FLAGS.gin_bindings = FLAGS.gin_bindings.split(',')
+    if FLAGS.gin_config == '': 
+        FLAGS.gin_config = None
+    else:
+        FLAGS.gin_config = FLAGS.gin_config.split(',')
+    
+    if FLAGS.gin_bindings == '': 
+        FLAGS.gin_bindings = None
+    else:
+        FLAGS.gin_bindings = FLAGS.gin_bindings.split(',')
     gin.parse_config_files_and_bindings(config_files=FLAGS.gin_config, bindings=FLAGS.gin_bindings)
     # print the flag.
     mlxu.print_flags(FLAGS,FLAGS_DEF)    
