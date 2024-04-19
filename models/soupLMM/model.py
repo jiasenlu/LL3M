@@ -65,12 +65,12 @@ default_kernel_init = initializers.lecun_normal()
 
 HIDDEN_ACT_MAPPING = {'silu': nn.silu, 'gelu': nn.gelu}
 
-OPEN_LLM_STANDARD_CONFIGS = {
+SOUP_LMM_STANDARD_CONFIGS = {
     'llama-llava-v1.5-7b': {
-        'vocab_size': 32000,
+        'vocab_size': 32016,
         'hidden_size': 4096,
         'intermediate_size': 11008,
-        'num_hidden_layers': 2,
+        'num_hidden_layers': 32,
         'num_attention_heads': 32,
         'num_key_value_heads': 32,
         'max_sequence_length': 4096,
@@ -83,27 +83,28 @@ OPEN_LLM_STANDARD_CONFIGS = {
         'hidden_act': 'silu', 
         'z_loss': 0.001,
         'norm_module': 'RMSNorm',
-        'expert_size': 4, 
+        'expert_size': 8, 
         "mm_vision_tower": "ViT-L/14-336",
     },
     
     'debug': { # A small model for debugging
-        'vocab_size': 32000,
-        'hidden_size': 512,
-        'intermediate_size': 512,
-        'num_hidden_layers': 2,
-        'num_attention_heads': 8,
+        'vocab_size': 32016,
+        'hidden_size': 4096,
+        'intermediate_size': 11008,
+        'num_hidden_layers': 1,
+        'num_attention_heads': 32,
+        'num_key_value_heads': 32,
         'max_sequence_length': 4096,
+        'max_position_embeddings': 8192,
+        'rope_theta': 10000.0, 
         'initializer_range': 0.02,
         'rms_norm_eps': 1e-5,
-        'max_position_embeddings': 4096,
-        'num_key_value_heads': 8,
-        'rope_theta': 10000.0, 
         'use_cache': True,
         'tie_word_embeddings': False,
-        'z_loss': 0.001,
         'hidden_act': 'silu', 
+        'z_loss': 0.001,
         'norm_module': 'RMSNorm',
+        'expert_size': 8, 
         "mm_vision_tower": "ViT-L/14-336",
     },
 }
@@ -181,7 +182,7 @@ class SoupLMMConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vocab_size=32000,
+        vocab_size=32016,
         additional_vocab_size=0,
         hidden_size=4096,
         intermediate_size=11008,
@@ -279,16 +280,24 @@ class SoupLMMConfig(PretrainedConfig):
 
             # vision part: 
             ("patch_embedding/kernel", PS("mp", "fsdp")),
-                     
-            ("attention/(wq|wk|wv)/bias", PS("mp",)),
-            ("attention/wo/bias", PS("fsdp",)),
+
+            ("image_vit/h/attention/(wq|wk|wv)/kernel", PS("fsdp", "mp")),
+            ("image_vit/h/attention/wo/kernel", PS("mp", "fsdp")),    
+            ("image_vit/h/attention/(wq|wk|wv)/bias", PS("mp",)),
+            ("image_vit/h/attention/wo/bias", PS("fsdp",)),
             
-            ("feed_forward/w1/bias", PS("mp",)),
-            ("feed_forward/w2/bias", PS("fsdp",)),
+            ("image_vit/h/feed_forward/w1/kernel", PS("fsdp", "mp")),
+            ("image_vit/h/feed_forward/w2/kernel", PS("mp", "fsdp")),
+            ("image_vit/h/feed_forward/w1/bias", PS("mp",)),
+            ("image_vit/h/feed_forward/w2/bias", PS("fsdp",)),
             
             ("mm_projector/w1/kernel", PS("fsdp", "mp")),
             ("mm_projector/w2/kernel", PS("mp", "fsdp")),
-            
+            ("mm_projector/w1/bias", PS("mp",)),
+            ("mm_projector/w2/bias", PS("fsdp",)),
+
+            ('image_vit/.*', PS(None,)),
+
             # embeddings
             ("transformer/wte/embedding", PS("expert", "mp", "fsdp")),
             # atention
@@ -318,14 +327,7 @@ class SoupLMMConfig(PretrainedConfig):
     def get_trainable_params():
         return tuple(
             [
-                "transformer/wte/embedding", 
-                "attention/(wq|wk|wv|wo)/kernel",
-                "feed_forward/(w1|w2|w3)/kernel",
-                "attention_norm/kernel",
-                "ffn_norm/kernel",
-                "transformer/ln_f/kernel",
-                "lm_head/kernel",
-                "mm_projector",
+                "alpha",
             ]
         )
 
@@ -359,8 +361,9 @@ class SoupLMMConfig(PretrainedConfig):
 
     @classmethod
     def load_config(cls, path):
-        if path in OPEN_LLM_STANDARD_CONFIGS:
-            return cls.from_dict(OPEN_LLM_STANDARD_CONFIGS[path])
+        if path in SOUP_LMM_STANDARD_CONFIGS:
+            config = SOUP_LMM_STANDARD_CONFIGS[path]
+            return cls.from_dict(config | VIT_STANDARD_CONFIGS[config['mm_vision_tower']])
         load_type, load_path = path.split('::', 1)
         if load_type == 'pickle':
             return cls.from_dict(load_pickle(load_path)['llama_config'])
@@ -370,7 +373,6 @@ class SoupLMMConfig(PretrainedConfig):
             return cls.from_dict(json.loads(raw_config))
         else:
             raise ValueError(f'Unsupported load config type: {load_type}')
-
 
 remat = nn_partitioning.remat
 
@@ -561,7 +563,6 @@ class FlaxSoupLMMModule(nn.Module):
             param_dtype=self.param_dtype,
         )
         
-        # self.wte_alpha = self.param('wte_alpha', jax.nn.initializers.constant(1.0), (self.config.expert,), self.param_dtype)
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
         self.h = FlaxSoupLLMBlockCollection(self.config, dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
         self.ln_f = norm_module(self.config.expert_size, self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype, param_dtype=self.param_dtype)

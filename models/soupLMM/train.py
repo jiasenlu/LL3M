@@ -104,8 +104,8 @@ def main(argv):
         eos_token_id=tokenizer.eos_token_id,
     ))
     
-    if model_config.vocab_size < tokenizer.vocab_size:
-        model_config.update(dict(vocab_size=tokenizer.vocab_size))
+    # if model_config.vocab_size < tokenizer.vocab_size:
+    #     model_config.update(dict(vocab_size=tokenizer.vocab_size))
     
     eval_dataset = None
     if FLAGS.train_dataset.type == 'seqio':
@@ -133,6 +133,11 @@ def main(argv):
     simulated_batch_size = real_batch_size * FLAGS.optimizer.accumulate_gradient_steps
     logging.info(f"Make sure your scheduler steps are based on the simulated batch size: {simulated_batch_size}!")
 
+    image_idx_length = dataset.image_idx_length
+    num_images = dataset.config.num_images
+    num_patches = dataset.config.num_patches
+    num_pixels_per_patch = dataset.config.num_pixels_per_patch
+    
     model = FlaxSoupLMMForCausalLMModule(
         model_config, 
         dtype=get_float_dtype_by_name(FLAGS.dtype), 
@@ -151,9 +156,11 @@ def main(argv):
     def init_fn(rng):
         rng_generator = JaxRNG(rng)
         params = model.init(
-            input_ids=jnp.zeros((1, seq_length), dtype=jnp.int32),
-            position_ids=jnp.zeros((1, seq_length), dtype=jnp.int32),
-            attention_mask=jnp.ones((1, seq_length), dtype=jnp.int32),
+            input_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
+            position_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
+            attention_mask=jnp.ones((4, seq_length), dtype=jnp.int32),
+            images=jnp.ones((4, num_images, num_patches, num_pixels_per_patch), dtype=jnp.float32),
+            image_input_idx=jnp.ones((4, num_images, image_idx_length), dtype=jnp.int32),
             rngs=rng_generator(model_config.rng_keys()),
         )
         return TrainState.create(params=params, tx=optimizer, apply_fn=None)

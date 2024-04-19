@@ -332,19 +332,19 @@ default_embed_init = initializers.variance_scaling(
   1.0, 'fan_in', 'normal', out_axis=0
 )
 
-def normalize(x, axis=None, eps=1e-12):
-    """Normalizes along dimension `axis` using an L2 norm.
-    This specialized function exists for numerical stability reasons.
-    Args:
-      x: An input ndarray.
-      axis: Dimension along which to normalize, e.g. `1` to separately normalize
-        vectors in a batch. Passing `None` views `t` as a flattened vector when
-        calculating the norm (equivalent to Frobenius norm).
-      eps: Epsilon to avoid dividing by zero.
-    Returns:
-      An array of the same shape as 'x' L2-normalized along 'axis'.
-    """
-    return x / (x.sum(axis=axis, keepdims=True) + eps)
+# def normalize(x, axis=None, eps=1e-12):
+#     """Normalizes along dimension `axis` using an L2 norm.
+#     This specialized function exists for numerical stability reasons.
+#     Args:
+#       x: An input ndarray.
+#       axis: Dimension along which to normalize, e.g. `1` to separately normalize
+#         vectors in a batch. Passing `None` views `t` as a flattened vector when
+#         calculating the norm (equivalent to Frobenius norm).
+#       eps: Epsilon to avoid dividing by zero.
+#     Returns:
+#       An array of the same shape as 'x' L2-normalized along 'axis'.
+#     """
+#     return x / (x.sum(axis=axis, keepdims=True) + eps)
 
 
 class SoupEmbed(nn.Module):
@@ -389,7 +389,7 @@ class SoupEmbed(nn.Module):
         (embedding,) = promote_dtype(
             self.embedding, dtype=self.dtype, inexact=False
         )    
-        embedding = jnp.sum(normalize(self.alpha[:,None,None], 0) * embedding, axis=0)
+        embedding = jnp.sum(jax.nn.softmax(self.alpha[:,None,None], 0) * embedding, axis=0)
         if self.num_embeddings == 1:
             return jnp.where(
                 jnp.broadcast_to(inputs[..., None], inputs.shape + (self.features,))
@@ -427,7 +427,7 @@ class SoupRMSNorm(nn.Module):
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
         weight = jnp.asarray(self.weight, self.dtype)
-        weight = jnp.sum(normalize(self.alpha[:,None], 0) * weight, axis=0)
+        weight = jnp.sum(jax.nn.softmax(self.alpha[:,None], 0) * weight, axis=0)
         return output * weight
 
 class SoupGemmaRMSNorm(nn.Module):
@@ -458,7 +458,7 @@ class SoupGemmaRMSNorm(nn.Module):
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
         weight = jnp.asarray(self.weight, self.dtype)
-        weight = jnp.sum(normalize(self.alpha[:,None], 0) * weight, axis=0)
+        weight = jnp.sum(jax.nn.softmax(self.alpha[:,None], 0) * weight, axis=0)
         return output * (1 + weight)
 
 
@@ -501,7 +501,7 @@ class SoupDense(nn.Module):
 
         inputs, kernel, bias = promote_dtype(inputs, kernel, bias, dtype=self.dtype)
 
-        kernel = jnp.sum(normalize(alpha[:,None,None], 0) * kernel, axis=0)
+        kernel = jnp.sum(jax.nn.softmax(alpha[:,None,None], 0) * kernel, axis=0)
 
         if self.dot_general_cls is not None:
             dot_general = self.dot_general_cls()
@@ -516,7 +516,7 @@ class SoupDense(nn.Module):
             precision=self.precision,
         )
         if bias is not None:
-            bias = jnp.sum(normalize(alpha[:,None], 0) * bias, axis=0)
+            bias = jnp.sum(jax.nn.softmax(alpha[:,None], 0) * bias, axis=0)
             y += jnp.reshape(bias, (1,) * (y.ndim - 1) + (-1,))
         
         return y

@@ -24,6 +24,12 @@ from data.data_utils import get_default_vocabulary, get_special_token_ids
 from module.checkpoint import StreamingCheckpointer
 import os
 
+from transformers import LlamaForCausalLM, CLIPModel
+
+VIT_HF_SOURCES  = {
+    "ViT-L/14-336": "openai/clip-vit-large-patch14-336"
+}
+
 OPENLLM_STANDARD_CONFIGS = {
     "llava-v1.5-vicuna-7b": {
         "vocab_size": 32016,
@@ -48,8 +54,31 @@ OPENLLM_STANDARD_CONFIGS = {
         "norm_eps": 1e-5,
         "num_key_value_heads": 32,
         "rope_theta": 10000.0,
+        "mm_hidden_size": 1024,
     },
 }
+
+VIT_STANDARD_CONFIGS = {
+    'ViT-L/14-336': {
+        'image_patch_size': 14,
+        'image_pos_patch_size': 14,
+        'image_emb_dim': 1024,
+        'image_num_heads': 16,
+        'image_num_layers': 23,
+        'image_head_dim': 64,
+        'image_mlp_dim': 4096,
+        'image_mlp_activations': ('gelu',),
+        'image_dropout_rate': 0.0,
+        'image_num_pos': 577,
+        'image_default_input_size': (336, 336),
+        'image_pooling_h': 2,
+        'image_pooling_w': 2,
+        'image_num_patch': (24, 24),
+        'image_norm_eps': 1e-5,
+        'image_num_key_value_heads': 16
+    },
+}
+
 
 def inverse_permute(params, w):
     n_layers = params["n_layers"]
@@ -71,6 +100,13 @@ def inverse_permute_kv(params, w):
     inverted_w = transposed_w.reshape(w.shape[0], n_kv_heads * (dim // n_heads), dim)
     return inverted_w
 
+def inverse_permute_vit(params, w):
+    n_heads = params["image_num_heads"]
+    dim = params["image_emb_dim"]
+    reshaped_w = w.reshape(n_heads, 2, dim // n_heads // 2, dim)
+    transposed_w = reshaped_w.transpose(0, 2, 1, 3)
+    inverted_w = transposed_w.reshape(dim, dim)
+    return inverted_w
 
 def recover_tree(keys, values):
   """Recovers a tree as a nested dict from flat names and values.
@@ -102,67 +138,79 @@ INCLUDES_MODELS = {
     'codellama':  'codellama/CodeLlama-7b-hf',
     'llemma': 'EleutherAI/llemma_7b',
     'llama2': 'meta-llama/Llama-2-7b-hf',
-    # 'vicuna': 'lmsys/vicuna-7b-v1.5',
     'meditron': 'epfl-llm/meditron-7b',
-    # 'llava': 'liuhaotian/llava-v1.6-vicuna-7b',
+    'vicuna': 'lmsys/vicuna-7b-v1.5',    
+    'finance': 'AdaptLLM/finance-chat',    
+    'law': 'AdaptLLM/law-chat',
+    'llava': 'liuhaotian/llava-v1.5-7b',
 }
 
+
 def main(args):
-    start = time.time()    
-    
+    start = time.time()
     all_ckpt = {}
-    
     for name, model_path in INCLUDES_MODELS.items():
         if name == 'llava':
             params = OPENLLM_STANDARD_CONFIGS['llava-v1.5-vicuna-7b']
-        else:    
+        else:
             params = OPENLLM_STANDARD_CONFIGS['llama2_7b']
 
         # load the checkpoints
-        if 'llava' == name:
-            ckpt_paths = sorted(Path(os.path.join(args.checkpoint_dir, model_path)).glob("*.safetensors"))            
-        else:
-            ckpt_paths = sorted(Path(os.path.join(args.checkpoint_dir, model_path)).glob("*.bin"))
+
+        ckpt_paths = sorted(Path(os.path.join(args.checkpoint_dir, model_path)).glob("*.bin"))
         ckpt = {}
+        
+        for i in tqdm(range(len(ckpt_paths))):
+            checkpoint = torch.load(ckpt_paths[i], map_location="cpu")
+            for k, v in checkpoint.items():
+                if k.startswith("model."):
+                    k = k[6:]
+                
+                if k.startswith("vision_tower.vision_tower.vision_model."):
+                    k = k[39:]
+                    
+                ckpt[k] = v
+                    
+        all_ckpt[name] = {"ckpt": ckpt}    
+    
+    if args.vit_checkpoint_type == 'safetensors':
+        ckpt_paths = sorted(Path(args.vit_checkpoint_dir).glob("*.safetensors"))
         vit_ckpt = {}
         
         for i in tqdm(range(len(ckpt_paths))):
-            if name == 'llava':
-                with safe_open(ckpt_paths[i], framework="pt", device="cpu") as f:
-                    for key in f.keys():
-                        vit_params = False
-                        k = key
-                        if key.startswith("model."):
-                            k = key[6:]
-                        if k.startswith("vision_tower.vision_tower.vision_model."):
-                            k = k[39:]
-                            vit_params = True
-                        if vit_params:
-                            vit_ckpt[k] = f.get_tensor(key)      
-                        else:
-                            ckpt[k] = f.get_tensor(key)    
-            else:
-                checkpoint = torch.load(ckpt_paths[i], map_location="cpu")
-                for k, v in checkpoint.items():
-                    vit_params = False
-                    if k.startswith("model."):
-                        k = k[6:]
-                    
-                    if k.startswith("vision_tower.vision_tower.vision_model."):
-                        k = k[39:]
-                        vit_params = True
-
-                    if vit_params:
-                        vit_ckpt[k] = v     
-                    else:
-                        ckpt[k] = v
-                    
-        all_ckpt[name] = {"ckpt": ckpt, "vit_ckpt": vit_ckpt}    
+            with safe_open(ckpt_paths[i], framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if key.startswith("vision_model."):
+                        k = key[13:]
+                        vit_ckpt[k] = f.get_tensor(key)        
+    
+    elif args.vit_checkpoint_type == "hf":
+        if args.vit_checkpoint_dir is None:
+            model_path = VIT_HF_SOURCES[args.vit_model_size]
+        else:
+            model_path = args.vit_checkpoint_dir
+        model = CLIPModel.from_pretrained(model_path)
+        checkpoint = model.state_dict()
+        vit_ckpt = {}
+        for k, v in checkpoint.items():
+            if k.startswith("vision_model."):
+                k = k[13:]
+                vit_ckpt[k] = v
+    else:
+        ckpt_paths = sorted(Path(args.vit_checkpoint_dir).glob("*.bin"))
+        vit_ckpt = {}
+        for i in tqdm(range(len(ckpt_paths))):
+            checkpoint = torch.load(ckpt_paths[i], map_location="cpu")
+            for k, v in checkpoint.items():
+                if k.startswith("vision_model."):
+                    k = k[13:]
+                    vit_ckpt[k] = v
     
     Dtype = jnp.bfloat16
     
     ckpts = {}
     # Merge the weight.
+    
     for name, _ in all_ckpt['llama2']['ckpt'].items():
         if 'inv_freq' in name:
             continue
@@ -171,21 +219,18 @@ def main(args):
         # codellama and llemma has 32016 vocab size. how to combine them?
         # Let's just replicate this for now.
         if name == 'embed_tokens.weight' or name == 'lm_head.weight':
-            print(name)
+            
             embed_token = torch.stack([weights[:32000, :] for weights in all_weights], dim=0)
-            extended_token = torch.stack([weights[32000:, :] for weights in all_weights if weights.shape[0]>32000], dim=0)
+            extended_token = torch.stack([weights[32000:, :] for weights in all_weights if weights.shape[0]==32016], dim=0)
+            
             ave_extended_token = torch.mean(extended_token, dim=0)
             extended_token = torch.cat([extended_token, ave_extended_token[None,:,:].repeat(len(INCLUDES_MODELS) - extended_token.shape[0], 1, 1)], 0)
             
-            new_embedding = torch.zeros((16, params["dim"]))                        
-            col_token_ids = 1
-            new_embedding[col_token_ids] = ckpt['image_newline'].float()
-            new_embedding = new_embedding[None,:,:].repeat(len(INCLUDES_MODELS), 1, 1)
-            
-            embed_token = torch.cat([embed_token, extended_token, new_embedding], 1)
+            embed_token = torch.cat([embed_token, extended_token], 1)
             ckpts[name] = embed_token
         else:
             ckpts[name] =  torch.stack(all_weights, dim=0)
+    
     ckpt = ckpts
 
     ckpt['mm_projector.0.weight'] = all_ckpt['llava']['ckpt']['mm_projector.0.weight']
@@ -227,19 +272,19 @@ def main(args):
                                     .float().numpy()
                                     .transpose(),
                                     dtype=Dtype),
-                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.self_attn.k_proj.bias"].float().numpy(), dtype=jnp.float32)
+                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.self_attn.k_proj.bias"].float().numpy(), dtype=Dtype)
                             },
                             "wv": {
                                 "kernel": jnp.array(vit_ckpt[f"encoder.layers.{layer}.self_attn.v_proj.weight"]
                                 .float().numpy()
                                 .transpose(), dtype=Dtype),
-                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.self_attn.v_proj.bias"].float().numpy(), dtype=jnp.float32)
+                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.self_attn.v_proj.bias"].float().numpy(), dtype=Dtype)
                             },
                             "wo": {
                                 "kernel": jnp.array(vit_ckpt[f"encoder.layers.{layer}.self_attn.out_proj.weight"]
                                 .float().numpy()
                                 .transpose(), dtype=Dtype),
-                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.self_attn.out_proj.bias"].float().numpy(), dtype=jnp.float32)
+                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.self_attn.out_proj.bias"].float().numpy(), dtype=Dtype)
                             },
                         },
                         "feed_forward":{
@@ -248,14 +293,14 @@ def main(args):
                                 .float()
                                 .numpy()
                                 .transpose(), dtype=Dtype),
-                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.mlp.fc1.bias"].float().numpy(), dtype=jnp.float32)
+                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.mlp.fc1.bias"].float().numpy(), dtype=Dtype)
                             },
                             "w2": {
                                 "kernel": jnp.array(vit_ckpt[f"encoder.layers.{layer}.mlp.fc2.weight"]
                                 .float()
                                 .numpy()
                                 .transpose(), dtype=Dtype),
-                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.mlp.fc2.bias"].float().numpy(), dtype=jnp.float32)
+                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.mlp.fc2.bias"].float().numpy(), dtype=Dtype)
                             },
                         },
                         "attention_norm": {
@@ -290,8 +335,12 @@ def main(args):
             },
             "wte": {
                 "embedding": jnp.array(ckpt["embed_tokens.weight"].float().numpy(), dtype=Dtype),
+                "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
             },
-            "ln_f": {"kernel": jnp.array(ckpt["norm.weight"].float().numpy(), dtype=Dtype)},
+            "ln_f": {
+                "kernel": jnp.array(ckpt["norm.weight"].float().numpy(), dtype=Dtype),
+                "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
+            },
             "h": {
                 "%d"
                 % (layer): {
@@ -300,23 +349,27 @@ def main(args):
                             "kernel": jnp.array(inverse_permute(
                                 params,
                                 ckpt[f"layers.{layer}.self_attn.q_proj.weight"].float().numpy(),
-                            ).transpose((0,2,1)), dtype=Dtype)
+                            ).transpose((0,2,1)), dtype=Dtype),
+                            "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
                         },
                         "wk": {
                             "kernel": jnp.array(inverse_permute_kv(
                                 params,
                                 ckpt[f"layers.{layer}.self_attn.k_proj.weight"].float().numpy(),
-                            ).transpose((0,2,1)), dtype=Dtype)
+                            ).transpose((0,2,1)), dtype=Dtype),
+                            "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
                         },
                         "wv": {
                             "kernel": jnp.array(ckpt[f"layers.{layer}.self_attn.v_proj.weight"]
                             .float().numpy()
-                            .transpose((0,2,1)), dtype=Dtype)
+                            .transpose((0,2,1)), dtype=Dtype),
+                            "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
                         },
                         "wo": {
                             "kernel": jnp.array(ckpt[f"layers.{layer}.self_attn.o_proj.weight"]
                             .float().numpy()
-                            .transpose((0,2,1)), dtype=Dtype)
+                            .transpose((0,2,1)), dtype=Dtype),
+                            "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
                         },
                     },
                     "feed_forward":{
@@ -324,28 +377,35 @@ def main(args):
                             "kernel": jnp.array(ckpt[f"layers.{layer}.mlp.gate_proj.weight"]
                             .float()
                             .numpy()
-                            .transpose((0,2,1)), dtype=Dtype)
+                            .transpose((0,2,1)), dtype=Dtype),
+                            "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
                         },
                         "w2": {
                             "kernel": jnp.array(ckpt[f"layers.{layer}.mlp.down_proj.weight"]
                             .float()
                             .numpy()
-                            .transpose((0,2,1)), dtype=Dtype)
+                            .transpose((0,2,1)), dtype=Dtype),
+                            "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
                         },
                         "w3": {
                             "kernel": jnp.array(ckpt[f"layers.{layer}.mlp.up_proj.weight"]
                             .float()
                             .numpy()
-                            .transpose((0,2,1)), dtype=Dtype)
+                            .transpose((0,2,1)), dtype=Dtype),
+                            "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
                         },
                     },
                     "attention_norm": {
-                        "kernel": jnp.array(ckpt[f"layers.{layer}.input_layernorm.weight"].float().numpy(), dtype=Dtype)
+                        "kernel": jnp.array(ckpt[f"layers.{layer}.input_layernorm.weight"].float().numpy(), dtype=Dtype),
+                        "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
+
                     },
                     "ffn_norm": {
                         "kernel": jnp.array(ckpt[
                             f"layers.{layer}.post_attention_layernorm.weight"
-                        ].float().numpy(), dtype=Dtype)
+                        ].float().numpy(), dtype=Dtype),
+                    "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
+
                     },
                 }
                 for layer in tqdm(range(params["n_layers"]))
@@ -353,7 +413,10 @@ def main(args):
         },
     }
     
-    jax_weights["lm_head"] = {"kernel": jnp.array(ckpt["lm_head.weight"].float().numpy().transpose((0,2,1)), dtype=Dtype)}
+    jax_weights["lm_head"] = {
+        "kernel": jnp.array(ckpt["lm_head.weight"].float().numpy().transpose((0,2,1)), dtype=Dtype),
+        "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
+    }
     
     print(f"Convert weight to easylm format finished...")
     print(f"Start to save...")
@@ -380,12 +443,6 @@ if __name__ == "__main__":
         "--output_file", type=str, help="Save model weight file path, it is a file."
     )
     parser.add_argument(
-        "--model_size",
-        type=str,
-        default="llava-v1.6-vicuna-7b",
-        help="model size",
-    )
-    parser.add_argument(
         "--streaming",
         action="store_true",
         default=True,
@@ -397,12 +454,30 @@ if __name__ == "__main__":
         default='pt',
         help="what is the format of the checkpoit.",
     )
-
+    parser.add_argument(
+        "--vit_model_size",
+        type=str,
+        default="ViT-L/14-336",
+        help="model size",
+    )
+    parser.add_argument(
+        "--vit_checkpoint_type",
+        type=str,
+        default='pt',
+        help="what is the format of the checkpoit.",
+    )
+    
+    parser.add_argument(
+        "--vit_checkpoint_dir",
+        type=str,
+        help="Need to be converted model weight dir. it is a dir",
+    )
+    
     args = parser.parse_args()
 
+    print(f"vit_checkpoint_dir: {args.vit_checkpoint_dir}")
     print(f"checkpoint_dir: {args.checkpoint_dir}")
     print(f"output_file: {args.output_file}")
-    print(f"model_size: {args.model_size}")
     print(f"streaming: {args.streaming}")
 
     main(args)

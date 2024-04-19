@@ -24,12 +24,16 @@ from data.data_utils import get_default_vocabulary, get_special_token_ids
 from module.checkpoint import StreamingCheckpointer
 import os
 
+VIT_HF_SOURCES  = {
+    "ViT-L/14-336": "openai/clip-vit-large-patch14-336"
+}
+
 OPENLLM_STANDARD_CONFIGS = {
     "llava-v1.5-vicuna-7b": {
         "vocab_size": 32016,
         "dim": 4096,
         "intermediate_size": 11008,
-        "n_layers": 2,
+        "n_layers": 32,
         "n_heads": 32,
         "norm_eps": 1e-5,
         "max_position_embeddings": 4096,
@@ -43,13 +47,35 @@ OPENLLM_STANDARD_CONFIGS = {
         "vocab_size": 32016,
         "dim": 4096,
         "intermediate_size": 11008,
-        "n_layers": 2,
+        "n_layers": 32,
         "n_heads": 32,
         "norm_eps": 1e-5,
         "num_key_value_heads": 32,
         "rope_theta": 10000.0,
     },
 }
+
+VIT_STANDARD_CONFIGS = {
+    'ViT-L/14-336': {
+        'image_patch_size': 14,
+        'image_pos_patch_size': 14,
+        'image_emb_dim': 1024,
+        'image_num_heads': 16,
+        'image_num_layers': 23,
+        'image_head_dim': 64,
+        'image_mlp_dim': 4096,
+        'image_mlp_activations': ('gelu',),
+        'image_dropout_rate': 0.0,
+        'image_num_pos': 577,
+        'image_default_input_size': (336, 336),
+        'image_pooling_h': 2,
+        'image_pooling_w': 2,
+        'image_num_patch': (24, 24),
+        'image_norm_eps': 1e-5,
+        'image_num_key_value_heads': 16
+    },
+}
+
 
 def inverse_permute(params, w):
     n_layers = params["n_layers"]
@@ -71,6 +97,13 @@ def inverse_permute_kv(params, w):
     inverted_w = transposed_w.reshape(w.shape[0], n_kv_heads * (dim // n_heads), dim)
     return inverted_w
 
+def inverse_permute_vit(params, w):
+    n_heads = params["image_num_heads"]
+    dim = params["image_emb_dim"]
+    reshaped_w = w.reshape(n_heads, 2, dim // n_heads // 2, dim)
+    transposed_w = reshaped_w.transpose(0, 2, 1, 3)
+    inverted_w = transposed_w.reshape(dim, dim)
+    return inverted_w
 
 def recover_tree(keys, values):
   """Recovers a tree as a nested dict from flat names and values.
@@ -102,67 +135,79 @@ INCLUDES_MODELS = {
     'codellama':  'codellama/CodeLlama-7b-hf',
     'llemma': 'EleutherAI/llemma_7b',
     'llama2': 'meta-llama/Llama-2-7b-hf',
-    # 'vicuna': 'lmsys/vicuna-7b-v1.5',
     'meditron': 'epfl-llm/meditron-7b',
-    # 'llava': 'liuhaotian/llava-v1.6-vicuna-7b',
+    'llava': 'liuhaotian/llava-v1.5-7b',
+    'vicuna': 'lmsys/vicuna-7b-v1.5',    
+    'finance': 'AdaptLLM/finance-chat',    
+    'law': 'AdaptLLM/law-chat',
 }
 
+
 def main(args):
-    start = time.time()    
-    
+    start = time.time()
     all_ckpt = {}
-    
     for name, model_path in INCLUDES_MODELS.items():
         if name == 'llava':
             params = OPENLLM_STANDARD_CONFIGS['llava-v1.5-vicuna-7b']
-        else:    
+        else:
             params = OPENLLM_STANDARD_CONFIGS['llama2_7b']
 
         # load the checkpoints
-        if 'llava' == name:
-            ckpt_paths = sorted(Path(os.path.join(args.checkpoint_dir, model_path)).glob("*.safetensors"))            
-        else:
-            ckpt_paths = sorted(Path(os.path.join(args.checkpoint_dir, model_path)).glob("*.bin"))
+
+        ckpt_paths = sorted(Path(os.path.join(args.checkpoint_dir, model_path)).glob("*.bin"))
         ckpt = {}
+        
+        for i in tqdm(range(len(ckpt_paths))):
+            checkpoint = torch.load(ckpt_paths[i], map_location="cpu")
+            for k, v in checkpoint.items():
+                if k.startswith("model."):
+                    k = k[6:]
+                
+                if k.startswith("vision_tower.vision_tower.vision_model."):
+                    k = k[39:]
+                    
+                ckpt[k] = v
+                    
+        all_ckpt[name] = {"ckpt": ckpt}    
+    
+    if args.vit_checkpoint_type == 'safetensors':
+        ckpt_paths = sorted(Path(args.vit_checkpoint_dir).glob("*.safetensors"))
         vit_ckpt = {}
         
         for i in tqdm(range(len(ckpt_paths))):
-            if name == 'llava':
-                with safe_open(ckpt_paths[i], framework="pt", device="cpu") as f:
-                    for key in f.keys():
-                        vit_params = False
-                        k = key
-                        if key.startswith("model."):
-                            k = key[6:]
-                        if k.startswith("vision_tower.vision_tower.vision_model."):
-                            k = k[39:]
-                            vit_params = True
-                        if vit_params:
-                            vit_ckpt[k] = f.get_tensor(key)      
-                        else:
-                            ckpt[k] = f.get_tensor(key)    
-            else:
-                checkpoint = torch.load(ckpt_paths[i], map_location="cpu")
-                for k, v in checkpoint.items():
-                    vit_params = False
-                    if k.startswith("model."):
-                        k = k[6:]
-                    
-                    if k.startswith("vision_tower.vision_tower.vision_model."):
-                        k = k[39:]
-                        vit_params = True
-
-                    if vit_params:
-                        vit_ckpt[k] = v     
-                    else:
-                        ckpt[k] = v
-                    
-        all_ckpt[name] = {"ckpt": ckpt, "vit_ckpt": vit_ckpt}    
+            with safe_open(ckpt_paths[i], framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if key.startswith("vision_model."):
+                        k = key[13:]
+                        vit_ckpt[k] = f.get_tensor(key)        
+    
+    elif args.vit_checkpoint_type == "hf":
+        if args.vit_checkpoint_dir is None:
+            model_path = VIT_HF_SOURCES[args.vit_model_size]
+        else:
+            model_path = args.vit_checkpoint_dir
+        model = CLIPModel.from_pretrained(model_path)
+        checkpoint = model.state_dict()
+        vit_ckpt = {}
+        for k, v in checkpoint.items():
+            if k.startswith("vision_model."):
+                k = k[13:]
+                vit_ckpt[k] = v
+    else:
+        ckpt_paths = sorted(Path(args.vit_checkpoint_dir).glob("*.bin"))
+        vit_ckpt = {}
+        for i in tqdm(range(len(ckpt_paths))):
+            checkpoint = torch.load(ckpt_paths[i], map_location="cpu")
+            for k, v in checkpoint.items():
+                if k.startswith("vision_model."):
+                    k = k[13:]
+                    vit_ckpt[k] = v
     
     Dtype = jnp.bfloat16
     
     ckpts = {}
     # Merge the weight.
+    
     for name, _ in all_ckpt['llama2']['ckpt'].items():
         if 'inv_freq' in name:
             continue
@@ -177,12 +222,7 @@ def main(args):
             ave_extended_token = torch.mean(extended_token, dim=0)
             extended_token = torch.cat([extended_token, ave_extended_token[None,:,:].repeat(len(INCLUDES_MODELS) - extended_token.shape[0], 1, 1)], 0)
             
-            new_embedding = torch.zeros((16, params["dim"]))                        
-            col_token_ids = 1
-            new_embedding[col_token_ids] = ckpt['image_newline'].float()
-            new_embedding = new_embedding[None,:,:].repeat(len(INCLUDES_MODELS), 1, 1)
-            
-            embed_token = torch.cat([embed_token, extended_token, new_embedding], 1)
+            embed_token = torch.cat([embed_token, extended_token], 1)
             ckpts[name] = embed_token
         else:
             ckpts[name] =  torch.stack(all_weights, dim=0)
@@ -380,12 +420,6 @@ if __name__ == "__main__":
         "--output_file", type=str, help="Save model weight file path, it is a file."
     )
     parser.add_argument(
-        "--model_size",
-        type=str,
-        default="llava-v1.6-vicuna-7b",
-        help="model size",
-    )
-    parser.add_argument(
         "--streaming",
         action="store_true",
         default=True,
@@ -397,12 +431,30 @@ if __name__ == "__main__":
         default='pt',
         help="what is the format of the checkpoit.",
     )
-
+    parser.add_argument(
+        "--vit_model_size",
+        type=str,
+        default="ViT-L/14-336",
+        help="model size",
+    )
+    parser.add_argument(
+        "--vit_checkpoint_type",
+        type=str,
+        default='pt',
+        help="what is the format of the checkpoit.",
+    )
+    
+    parser.add_argument(
+        "--vit_checkpoint_dir",
+        type=str,
+        help="Need to be converted model weight dir. it is a dir",
+    )
+    
     args = parser.parse_args()
 
+    print(f"vit_checkpoint_dir: {args.vit_checkpoint_dir}")
     print(f"checkpoint_dir: {args.checkpoint_dir}")
     print(f"output_file: {args.output_file}")
-    print(f"model_size: {args.model_size}")
     print(f"streaming: {args.streaming}")
 
     main(args)
