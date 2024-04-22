@@ -392,3 +392,392 @@ def full_lm(dataset, sequence_length, output_features):
   # Don't use `split_tokens_to_targets_length` since we've alrady added EOS.
   ds = split_tokens(ds, max_tokens_per_segment=sequence_length['targets'])
   return ds
+
+
+# ------------------------
+# Multimodal Preprocessor
+# ------------------------
+
+@seqio.map_over_dataset
+def extract_llava(ex, sequence_length, output_features):
+    tf.assert_equal(tf.shape(ex['conversations']['value'])[0], 2)
+    prompt = ex['conversations']['value'][0]
+    text = ex['conversations']['value'][1]
+    ex.pop('conversations')
+    ex["text"] = text
+    ex["prompt"] = prompt
+    return ex
+  
+def select_tiling(h, w, patch_size, max_num_patches):
+    """Decide how best to divide in image of size [w, h] in up to max_num_patches of size patch_size"""
+    original_size = tf.stack([h, w])  # [1, 2]
+    original_res = h * w
+    tilings = []
+    for i in range(1, max_num_patches+1):
+        for j in range(1, max_num_patches+1):
+            if i*j <= max_num_patches:
+                tilings.append((i, j))
+    # sort so argmin and argmax favour smaller tilings in the event of a tie
+    tilings.sort(key=lambda x: (x[0]*x[1], x[0]))
+    candidate_tilings = tf.constant(tilings, dtype=tf.int32)  # [n_resolutions, 2]
+    candidate_resolutions = candidate_tilings * patch_size  # [n_resolutions, 2]
+
+    # How much we would need to scale the image to fit exactly in each tiling
+    required_scale_d = tf.cast(candidate_resolutions, tf.float32) / tf.cast(original_size[None, :], tf.float32)
+    required_scale = tf.reduce_min(required_scale_d, axis=-1, keepdims=True)  # [n_resolutions, 1]
+    if tf.reduce_all(required_scale < 1):
+        # We are forced to downscale, so try to minimize the amount of downscaling
+        ix = tf.argmax(required_scale)[0]
+    else:
+        # Pick the resolution that required the least upscaling so that it most closely fits the image
+        required_scale = tf.where(required_scale < 1.0, 10e9, required_scale)
+        ix = tf.argmin(required_scale)[0]
+    return candidate_tilings[ix]
+  
+@gin.configurable()
+def image_to_patches_and_tokens(
+    image, is_training,
+    mode="patchify-v2-and-resize-c2",
+    do_random_scale=True,
+    base_image_input_size=BASE_IMAGE_INPUT_SIZE,
+    base_image_input_d=BASE_IMAGE_INPUT_D,
+    max_num_patches=MAX_NUM_PATCHES,
+    random_scale_max=RANDOM_SCALE_MAX,
+    random_scale_min=RANDOM_SCALE_MIN,
+    random_scale_ratio=RANDOM_SCALE_RATIO,
+    image_token_length_w=12,
+    image_token_length_h=12,
+    use_col_tokens=True, 
+    use_img_start_end_token=True
+):
+    """
+    Args:
+        image: [w, h, 3] image to patchify
+    Returns:
+        tokens: (n_tokens,) tf.int32 tokens, pad tokens indicate where to insert the image features
+                            there will exactly `IMAGE_TOKEN_LENGTH` pad tokens
+        patches: (n_patches, n_subpatches, subpatch_dim) individual patches, `n_patches` might
+                 change between images but the other dimension are fixed
+    """
+    if image.dtype == tf.string:
+        image = tf.image.decode_jpeg(image)
+    image = tf.image.convert_image_dtype(image, dtype=tf.float32)
+    if do_random_scale:
+        do_random_scale = is_training
+
+    tokens_per_image = image_token_length_w * image_token_length_h
+    image_base_patch_w = base_image_input_size[1] // base_image_input_d
+    image_base_patch_h = base_image_input_size[0] // base_image_input_d
+    extra_image = False
+    patch_ordering = None
+
+    def _resize(_image, sz):
+        return resize_and_pad(
+            _image, sz,
+            do_random_scale=do_random_scale,
+            random_scale_max=random_scale_max,
+            random_scale_min=random_scale_min,
+            shrink_both_sides=True,
+            do_flip_if_vertical=False,
+            random_scale_ratio=random_scale_ratio,
+            resize_method='random' if is_training else tf.image.ResizeMethod.BILINEAR)
+
+    if mode == "resize":
+        patches, img_mask, this_image_info = _resize(image, base_image_input_size)
+        image_layout_impatch_w = 1
+        image_layout_impatch_h = 1
+        patches = einops.rearrange(
+            patches, '(dy h dh) (dx w dw) c -> (dy dx) (h w) (dh dw c)',
+            dh=base_image_input_d,
+            dw=base_image_input_d,
+            dy=1,
+            dx=1,
+            h=image_base_patch_h,
+            w=image_base_patch_w
+        )
+        patch_ordering = tf.range(tokens_per_image)[None, :]
+
+    elif mode in ["patchify", "patchify-and-resize", "patchify-v2", "patchify-v2-and-resize", "patchify-v2-and-resize-c2"]:
+        original_image_w = tf.shape(image, out_type=tf.int32)[0]
+        original_image_h = tf.shape(image, out_type=tf.int32)[1]
+        assert base_image_input_size[0] == base_image_input_size[1]
+        base_patch_size = base_image_input_size[0]
+        tiling = select_tiling(original_image_w, original_image_h, base_patch_size, max_num_patches)
+
+        patches, img_mask, this_image_info = _resize(
+            image, [tiling[0]*base_patch_size, tiling[1]*base_patch_size])
+        patches = einops.rearrange(
+            patches, '(dy h dh) (dx w dw) c -> (dy dx) (h w) (dh dw c)',
+            dh=base_image_input_d,
+            dw=base_image_input_d,
+            dy=tiling[0],
+            dx=tiling[1],
+            h=image_base_patch_h,
+            w=image_base_patch_w
+        )
+        if 'v2' in mode:
+            # Order patches left-to-right not crop-by-crop
+            patch_ordering = tf.reshape(
+                tf.range(tokens_per_image*tiling[0]*tiling[1]),
+                [tiling[0], tiling[1], image_token_length_w, image_token_length_h])
+            patch_ordering = tf.transpose(patch_ordering, [0, 2, 1, 3])
+            patch_ordering = tf.reshape(patch_ordering, (-1, tokens_per_image))
+        else:
+            patch_ordering = None
+
+        # given image size, determine the number of patch size.
+        image_layout_impatch_w = tiling[0]
+        image_layout_impatch_h = tiling[1]
+
+        if "resize" in mode:
+            extra_image = True
+            resized = _resize(image, base_image_input_size)[0]
+            resized = einops.rearrange(
+                resized, '(dy h dh) (dx w dw) c -> (dy dx) (h w) (dh dw c)',
+                dh=base_image_input_d,
+                dw=base_image_input_d,
+                dy=1,
+                dx=1,
+                h=image_base_patch_h,
+                w=image_base_patch_w
+            )
+            if 'c2' in mode:
+              patches = tf.concat([resized, patches], 0)              
+            else:
+              patches = tf.concat([patches, resized], 0)
+              
+            if patch_ordering is not None:
+                patch_ordering = tf.concat(
+                  [tf.range(0, tokens_per_image)[None, :], patch_ordering+tokens_per_image], 0)
+    else:
+        raise NotImplementedError(mode)
+
+    special_token_ids = get_special_token_ids()
+    image_patch_token = special_token_ids[DEFAULT_IMAGE_PATCH_TOKEN]
+    if use_img_start_end_token or use_col_tokens:
+      image_start_token = special_token_ids[DEFAULT_IM_START_TOKEN]
+      image_end_token = special_token_ids[DEFAULT_IM_END_TOKEN]
+      image_col_token = special_token_ids[DEFAULT_IM_COL_TOKEN]
+
+      
+    per_row = tf.fill((image_token_length_w*image_layout_impatch_w,), image_patch_token,)
+    if use_col_tokens:
+        per_row = tf.concat([per_row, [image_patch_token]], 0)
+
+    joint = tf.tile(per_row, [image_token_length_h * image_layout_impatch_h])
+    
+    if use_img_start_end_token:
+      joint = [
+          [image_start_token],
+          joint,
+          [image_end_token]
+      ]
+      
+    if extra_image:
+        per_row = tf.fill((image_token_length_w,), image_patch_token,)
+        if use_col_tokens:
+            per_row = tf.concat([per_row, [image_col_token]], 0)
+        extra_tokens = tf.tile(per_row, [image_token_length_h])
+        if 'c2' in mode:
+          if use_img_start_end_token:
+            joint = [
+                [image_start_token],
+                extra_tokens,
+                [image_end_token],
+            ] + joint
+          else:
+            joint = [extra_tokens] + joint
+        else:
+          if use_img_start_end_token:
+            joint += [
+                [image_start_token],
+                extra_tokens,
+                [image_end_token]
+            ]
+          else:
+            joint += [extra_tokens]
+          
+    return patches, tf.concat(joint, 0), (image_layout_impatch_w, image_layout_impatch_w), patch_ordering
+
+@gin.configurable()
+def multimodal_preprocessor(
+  ds, sequence_length, output_features,
+  flatten_by_caption=False,
+  include_response=True,
+  prompt_type = 'mistral',
+  include_metadata=False,
+  decode_jpeg = False,
+  image_token_length_w = 12,
+  image_token_length_h = 12,
+  use_col_tokens = True,
+  use_img_start_end_token = True,
+  mode = 'patchify-v2-and-resize-c2',
+  max_num_patches = 1,
+):
+  
+  vocab = get_default_vocabulary()
+  is_training = sequence_length.get('is_training', True)
+
+  def to_inputs_and_targets(ex, seeds=None):
+
+    if decode_jpeg:
+      image = tf.image.decode_jpeg(ex['image'], channels=3)
+    else:
+      image = ex['image']
+      
+    image, image_tokens, _, patch_order = image_to_patches_and_tokens(
+        image, is_training, 
+        image_token_length_w=image_token_length_w, 
+        image_token_length_h=image_token_length_h, 
+        use_col_tokens=use_col_tokens, 
+        use_img_start_end_token=use_img_start_end_token, 
+        mode=mode,
+        max_num_patches=max_num_patches)
+
+    if prompt_type == "plain-v1":
+        prompt_list = tf.constant([
+            'Here is an image\n',
+            'Picture:\n',
+            'Image:\n',
+            'Examine this image:\n',
+            'Look at this image:\n',
+        ])
+        index = tf.random.uniform(shape=(), minval=0, maxval=len(prompt_list), dtype=tf.int32)
+        encoded_prefix = tf.concat([vocab.encode_tf(prompt_list[index]), image_tokens], 0)
+    elif prompt_type == "null":
+        encoded_prefix = image_tokens
+        
+    elif prompt_type == "mistral":
+        prompt_template = PROPMPT_MANAGER[prompt_type]
+        prompt_list = tf.constant(PROMPT_LLAVA_PRETRAIN)
+        index = tf.random.uniform(shape=(), minval=0, maxval=len(prompt_list), dtype=tf.int32)
+        
+        image_token_strings = vocab.decode_tf(image_tokens)
+        # remove the system prompt and add the caption prompt.       
+        image_token_string_with_prompt = tf.strings.regex_replace(prompt_list[index], '<image>', image_token_strings)
+        
+        encoded_prefix = tf.concat([
+            vocab.encode_tf(prompt_template['B_INST']),
+            vocab.encode_tf(image_token_string_with_prompt),
+            vocab.encode_tf(prompt_template['E_INST']),
+        ], 0)
+    elif prompt_type == "vicuna_v1":
+        prompt_template = PROPMPT_MANAGER[prompt_type]
+        encoded_prefix = tf.concat([
+            vocab.encode_tf(tf.strings.join([prompt_template['SYS_PREFIX'], prompt_template['B_INST']])),
+            image_tokens,
+        ], 0)
+    else:
+        prompt_template = PROPMPT_MANAGER[prompt_type]
+        encoded_prefix = tf.concat([
+            vocab.encode_tf(tf.strings.join([prompt_template['B_INST'], prompt_template['SYS_PREFIX']])),
+            image_tokens,
+            vocab.encode_tf(prompt_template['E_INST']),
+        ], 0)
+      
+    prefix_loss_weights = tf.zeros(tf.shape(encoded_prefix), tf.int32)
+
+    if include_response:
+      if "conversations" in ex:
+        # define the hash table to convert the gpt and user to target format. 
+        keys_tensor = tf.constant([f'human', f'gpt'])
+        vals_tensor = tf.constant([prompt_template['B_INST'], prompt_template['E_INST']])
+        INST_table = tf.lookup.StaticHashTable(
+            tf.lookup.KeyValueTensorInitializer(
+                keys_tensor, 
+                vals_tensor
+            ), 
+            default_value=prompt_template['E_INST']
+        )
+        INST_str = INST_table.lookup(ex['conversations']['from'])
+
+        vals_tensor = tf.constant([prompt_template['SEP'], prompt_template['SEP2']])
+        SEPT_table = tf.lookup.StaticHashTable(
+            tf.lookup.KeyValueTensorInitializer(
+                keys_tensor, 
+                vals_tensor
+            ), 
+            default_value=prompt_template['SEP']
+        )
+        SEPT_str = SEPT_table.lookup(ex['conversations']['from'])
+
+        image_token_strings = vocab.decode_tf(image_tokens) 
+        # dictionary to convert the conversation into prompt.
+        text = tf.concat([tf.reshape(INST_str, [-1,1]), tf.reshape(ex['conversations']['value'], [-1,1]), tf.reshape(SEPT_str, [-1, 1])], axis=1)
+        text = tf.strings.regex_replace(text, '<image>', image_token_strings)
+        encoded_response = vocab.encode_tf(text)
+
+        response_gpt_index = tf.cast(ex['conversations']['from'] == 'gpt', tf.int32)
+        
+        # we need to get the number of token with response_gpt_index and last 2 columns.
+        response_loss_weights = encoded_response * tf.reshape(response_gpt_index, [-1, 1, 1]) * tf.reshape(tf.constant([0, 1, 1]), [1, -1, 1])
+        
+        encoded_response = encoded_response.flat_values
+        response_loss_weights = tf.cast(response_loss_weights.flat_values > 0, tf.int32)
+        targets = tf.concat([encoded_prefix, encoded_response], axis=0)
+        decoder_loss_weights = tf.concat([prefix_loss_weights, response_loss_weights], axis=0)
+        
+      else:
+        if len(ex['text'].shape) > 0:
+            index = tf.random.uniform(shape=(), minval=0, maxval=tf.shape(ex['text'])[0], dtype=tf.int32)
+            text = ex['text'][index]
+        else:
+            text = ex['text']
+        encoded_response = vocab.encode_tf(text)
+        encoded_response = tf.pad(encoded_response, [[0, 1]], constant_values=vocab.eos_token_id)
+        response_loss_weights = tf.ones(tf.shape(encoded_response), tf.int32)
+        targets = tf.concat([encoded_prefix, encoded_response], axis=0)
+        decoder_loss_weights = tf.concat([prefix_loss_weights, response_loss_weights], axis=0)
+    else:
+      # Only the prompt, used for evaluation
+      targets = encoded_prefix
+      decoder_loss_weights = prefix_loss_weights
+    
+    image_patch_token = get_special_token_ids()[DEFAULT_IMAGE_PATCH_TOKEN]
+  
+    image_input_idx = targets == image_patch_token
+    image_input_idx = tf.experimental.numpy.nonzero(image_input_idx)[0]
+
+    if patch_order is not None:
+        # patch_order is patch_ix->order
+        # First we build an array of patch_ix's sorted by their ordering
+        patch_order = tf.reshape(patch_order, [-1])
+        n = tf.shape(patch_order)[0]
+        sorted_patch_ixs = tf.scatter_nd(patch_order[:, None], tf.range(n), [n])
+        # Now `image_input_idx` so it points to lists tokens in order patches should
+        # be inserted instead of sequentially
+        image_input_idx = tf.gather(image_input_idx, sorted_patch_ixs)
+
+    image_input_idx = tf.reshape(image_input_idx, [-1, image_token_length_w * image_token_length_h])
+    image_input_idx = tf.cast(image_input_idx, tf.int32)
+    out = {
+        'targets': targets,
+        'image_input_idx': image_input_idx,
+        'images': image,
+        'decoder_loss_weights': decoder_loss_weights,
+    }
+    if include_metadata:
+        if len(ex["text"].shape) > 0:
+            # FIXME can this be variable lengths after all?
+            out["metadata/captions"] = tf.strings.reduce_join(
+                tf.strings.regex_replace(ex['text'], "\\s+", " "),
+                separator="\n"
+            )
+        else:
+            out["metadata/captions"] = ex["text"]
+        if "url" in ex:
+            out["metadata/image_url"] = ex["url"]
+        if "image/filename" in ex:
+            image_id = tf.strings.substr(ex["image/filename"], 0, tf.strings.length(ex["image/filename"])-4)
+            out["metadata/image_id"] = tf.strings.to_number(image_id)
+        out["metadata/image"] = resize_and_pad(
+            tf.image.convert_image_dtype(ex["image"], dtype=tf.float32), (336, 336),
+            do_random_scale=False, normalize=False, do_flip_if_vertical=False)[0]
+    return out
+
+  if flatten_by_caption:
+    if len(ds.element_spec["text"].shape) > 0:
+      ds = flatten_parts(ds, parts=["text"])
+
+  ds = ds.map(to_inputs_and_targets, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  return ds

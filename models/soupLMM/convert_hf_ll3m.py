@@ -24,6 +24,8 @@ from data.data_utils import get_default_vocabulary, get_special_token_ids
 from module.checkpoint import StreamingCheckpointer
 import os
 
+from transformers import LlamaForCausalLM, CLIPModel
+
 VIT_HF_SOURCES  = {
     "ViT-L/14-336": "openai/clip-vit-large-patch14-336"
 }
@@ -33,7 +35,7 @@ OPENLLM_STANDARD_CONFIGS = {
         "vocab_size": 32016,
         "dim": 4096,
         "intermediate_size": 11008,
-        "n_layers": 32,
+        "n_layers": 2,
         "n_heads": 32,
         "norm_eps": 1e-5,
         "max_position_embeddings": 4096,
@@ -47,11 +49,12 @@ OPENLLM_STANDARD_CONFIGS = {
         "vocab_size": 32016,
         "dim": 4096,
         "intermediate_size": 11008,
-        "n_layers": 32,
+        "n_layers": 2,
         "n_heads": 32,
         "norm_eps": 1e-5,
         "num_key_value_heads": 32,
         "rope_theta": 10000.0,
+        "mm_hidden_size": 1024,
     },
 }
 
@@ -136,10 +139,10 @@ INCLUDES_MODELS = {
     'llemma': 'EleutherAI/llemma_7b',
     'llama2': 'meta-llama/Llama-2-7b-hf',
     'meditron': 'epfl-llm/meditron-7b',
-    'llava': 'liuhaotian/llava-v1.5-7b',
     'vicuna': 'lmsys/vicuna-7b-v1.5',    
     'finance': 'AdaptLLM/finance-chat',    
     'law': 'AdaptLLM/law-chat',
+    'llava': 'liuhaotian/llava-v1.5-7b',
 }
 
 
@@ -216,9 +219,10 @@ def main(args):
         # codellama and llemma has 32016 vocab size. how to combine them?
         # Let's just replicate this for now.
         if name == 'embed_tokens.weight' or name == 'lm_head.weight':
-            print(name)
+            
             embed_token = torch.stack([weights[:32000, :] for weights in all_weights], dim=0)
-            extended_token = torch.stack([weights[32000:, :] for weights in all_weights if weights.shape[0]>32000], dim=0)
+            extended_token = torch.stack([weights[32000:, :] for weights in all_weights if weights.shape[0]==32016], dim=0)
+            
             ave_extended_token = torch.mean(extended_token, dim=0)
             extended_token = torch.cat([extended_token, ave_extended_token[None,:,:].repeat(len(INCLUDES_MODELS) - extended_token.shape[0], 1, 1)], 0)
             
@@ -226,6 +230,7 @@ def main(args):
             ckpts[name] = embed_token
         else:
             ckpts[name] =  torch.stack(all_weights, dim=0)
+    
     ckpt = ckpts
 
     ckpt['mm_projector.0.weight'] = all_ckpt['llava']['ckpt']['mm_projector.0.weight']
@@ -267,19 +272,19 @@ def main(args):
                                     .float().numpy()
                                     .transpose(),
                                     dtype=Dtype),
-                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.self_attn.k_proj.bias"].float().numpy(), dtype=jnp.float32)
+                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.self_attn.k_proj.bias"].float().numpy(), dtype=Dtype)
                             },
                             "wv": {
                                 "kernel": jnp.array(vit_ckpt[f"encoder.layers.{layer}.self_attn.v_proj.weight"]
                                 .float().numpy()
                                 .transpose(), dtype=Dtype),
-                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.self_attn.v_proj.bias"].float().numpy(), dtype=jnp.float32)
+                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.self_attn.v_proj.bias"].float().numpy(), dtype=Dtype)
                             },
                             "wo": {
                                 "kernel": jnp.array(vit_ckpt[f"encoder.layers.{layer}.self_attn.out_proj.weight"]
                                 .float().numpy()
                                 .transpose(), dtype=Dtype),
-                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.self_attn.out_proj.bias"].float().numpy(), dtype=jnp.float32)
+                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.self_attn.out_proj.bias"].float().numpy(), dtype=Dtype)
                             },
                         },
                         "feed_forward":{
@@ -288,14 +293,14 @@ def main(args):
                                 .float()
                                 .numpy()
                                 .transpose(), dtype=Dtype),
-                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.mlp.fc1.bias"].float().numpy(), dtype=jnp.float32)
+                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.mlp.fc1.bias"].float().numpy(), dtype=Dtype)
                             },
                             "w2": {
                                 "kernel": jnp.array(vit_ckpt[f"encoder.layers.{layer}.mlp.fc2.weight"]
                                 .float()
                                 .numpy()
                                 .transpose(), dtype=Dtype),
-                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.mlp.fc2.bias"].float().numpy(), dtype=jnp.float32)
+                                "bias": jnp.array(vit_ckpt[f"encoder.layers.{layer}.mlp.fc2.bias"].float().numpy(), dtype=Dtype)
                             },
                         },
                         "attention_norm": {
@@ -330,8 +335,12 @@ def main(args):
             },
             "wte": {
                 "embedding": jnp.array(ckpt["embed_tokens.weight"].float().numpy(), dtype=Dtype),
+                "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
             },
-            "ln_f": {"kernel": jnp.array(ckpt["norm.weight"].float().numpy(), dtype=Dtype)},
+            "ln_f": {
+                "kernel": jnp.array(ckpt["norm.weight"].float().numpy(), dtype=Dtype),
+                "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
+            },
             "h": {
                 "%d"
                 % (layer): {
@@ -340,23 +349,27 @@ def main(args):
                             "kernel": jnp.array(inverse_permute(
                                 params,
                                 ckpt[f"layers.{layer}.self_attn.q_proj.weight"].float().numpy(),
-                            ).transpose((0,2,1)), dtype=Dtype)
+                            ).transpose((0,2,1)), dtype=Dtype),
+                            "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
                         },
                         "wk": {
                             "kernel": jnp.array(inverse_permute_kv(
                                 params,
                                 ckpt[f"layers.{layer}.self_attn.k_proj.weight"].float().numpy(),
-                            ).transpose((0,2,1)), dtype=Dtype)
+                            ).transpose((0,2,1)), dtype=Dtype),
+                            "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
                         },
                         "wv": {
                             "kernel": jnp.array(ckpt[f"layers.{layer}.self_attn.v_proj.weight"]
                             .float().numpy()
-                            .transpose((0,2,1)), dtype=Dtype)
+                            .transpose((0,2,1)), dtype=Dtype),
+                            "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
                         },
                         "wo": {
                             "kernel": jnp.array(ckpt[f"layers.{layer}.self_attn.o_proj.weight"]
                             .float().numpy()
-                            .transpose((0,2,1)), dtype=Dtype)
+                            .transpose((0,2,1)), dtype=Dtype),
+                            "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
                         },
                     },
                     "feed_forward":{
@@ -364,28 +377,35 @@ def main(args):
                             "kernel": jnp.array(ckpt[f"layers.{layer}.mlp.gate_proj.weight"]
                             .float()
                             .numpy()
-                            .transpose((0,2,1)), dtype=Dtype)
+                            .transpose((0,2,1)), dtype=Dtype),
+                            "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
                         },
                         "w2": {
                             "kernel": jnp.array(ckpt[f"layers.{layer}.mlp.down_proj.weight"]
                             .float()
                             .numpy()
-                            .transpose((0,2,1)), dtype=Dtype)
+                            .transpose((0,2,1)), dtype=Dtype),
+                            "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
                         },
                         "w3": {
                             "kernel": jnp.array(ckpt[f"layers.{layer}.mlp.up_proj.weight"]
                             .float()
                             .numpy()
-                            .transpose((0,2,1)), dtype=Dtype)
+                            .transpose((0,2,1)), dtype=Dtype),
+                            "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
                         },
                     },
                     "attention_norm": {
-                        "kernel": jnp.array(ckpt[f"layers.{layer}.input_layernorm.weight"].float().numpy(), dtype=Dtype)
+                        "kernel": jnp.array(ckpt[f"layers.{layer}.input_layernorm.weight"].float().numpy(), dtype=Dtype),
+                        "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
+
                     },
                     "ffn_norm": {
                         "kernel": jnp.array(ckpt[
                             f"layers.{layer}.post_attention_layernorm.weight"
-                        ].float().numpy(), dtype=Dtype)
+                        ].float().numpy(), dtype=Dtype),
+                    "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
+
                     },
                 }
                 for layer in tqdm(range(params["n_layers"]))
@@ -393,7 +413,10 @@ def main(args):
         },
     }
     
-    jax_weights["lm_head"] = {"kernel": jnp.array(ckpt["lm_head.weight"].float().numpy().transpose((0,2,1)), dtype=Dtype)}
+    jax_weights["lm_head"] = {
+        "kernel": jnp.array(ckpt["lm_head.weight"].float().numpy().transpose((0,2,1)), dtype=Dtype),
+        "alpha": jnp.array(jnp.ones((len(all_ckpt),)), dtype=Dtype),
+    }
     
     print(f"Convert weight to easylm format finished...")
     print(f"Start to save...")

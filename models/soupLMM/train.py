@@ -16,7 +16,7 @@ import gin
 import seqio
 from data.tasks import TaskRegistry
 from data.mixtures import MixtureRegistry
-from data.data_utils import get_default_vocabulary, LMFeatureConverter
+from data.data_utils import get_default_vocabulary
 
 from data.data_factory import DatasetFactory
 from module.checkpoint import StreamingCheckpointer
@@ -32,7 +32,7 @@ from module import metrics as metrics_lib
 import clu
 import clu.metrics as clu_metrics
 
-from models.soupLLM.model import SoupLLMConfig, FlaxSoupLLMForCausalLMModule
+from models.soupLMM.model import SoupLMMConfig, FlaxSoupLMMForCausalLMModule
 
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     seed=42,
@@ -50,12 +50,12 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     save_model_freq=0,
     save_milestone_freq=0,
     eval_steps=0,
-    tokenizer=SoupLLMConfig.get_tokenizer_config(),
+    tokenizer=SoupLMMConfig.get_tokenizer_config(),
     train_dataset=DatasetFactory.get_default_config(),
     eval_dataset=DatasetFactory.get_default_config(),
     optimizer=OptimizerFactory.get_default_config(),
     checkpointer=StreamingCheckpointer.get_default_config(),
-    model=SoupLLMConfig.get_default_config(),
+    model=SoupLMMConfig.get_default_config(),
     logger=mlxu.WandBLogger.get_default_config(),
     log_all_worker=False,
     jax_distributed=JaxDistributedConfig.get_default_config(),
@@ -74,6 +74,7 @@ def main(argv):
         FLAGS.gin_bindings = None
     else:
         FLAGS.gin_bindings = FLAGS.gin_bindings.split(',')
+
     gin.parse_config_files_and_bindings(config_files=FLAGS.gin_config, bindings=FLAGS.gin_bindings)
     # print the flag.
     mlxu.print_flags(FLAGS,FLAGS_DEF)    
@@ -87,13 +88,13 @@ def main(argv):
     )
     set_random_seed(FLAGS.seed)
 
-    mesh = SoupLLMConfig.get_jax_mesh(FLAGS.mesh_dim)
+    mesh = SoupLMMConfig.get_jax_mesh(FLAGS.mesh_dim)
     tokenizer = get_default_vocabulary()
 
     if FLAGS.load_model_config != '':
-        model_config = SoupLLMConfig.load_config(FLAGS.load_model_config)
+        model_config = SoupLMMConfig.load_config(FLAGS.load_model_config)
     else:
-        model_config = SoupLLMConfig(**FLAGS.model)
+        model_config = SoupLMMConfig(**FLAGS.model)
 
     if FLAGS.update_model_config != '':
         model_config.update(dict(eval(FLAGS.update_model_config)))
@@ -103,8 +104,8 @@ def main(argv):
         eos_token_id=tokenizer.eos_token_id,
     ))
     
-    if model_config.vocab_size < tokenizer.vocab_size:
-        model_config.update(dict(vocab_size=tokenizer.vocab_size))
+    # if model_config.vocab_size < tokenizer.vocab_size:
+    #     model_config.update(dict(vocab_size=tokenizer.vocab_size))
     
     eval_dataset = None
     if FLAGS.train_dataset.type == 'seqio':
@@ -112,7 +113,7 @@ def main(argv):
             FLAGS.train_dataset, tokenizer,
             mesh=mesh, feature_converter_cls=model_config.get_feature_converter)
     else:
-        tokenizer = SoupLLMConfig.get_tokenizer(FLAGS.tokenizer)
+        tokenizer = SoupLMMConfig.get_tokenizer(FLAGS.tokenizer)
         dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
         if FLAGS.load_dataset_state != '':
             dataset.load_state_dict(mlxu.load_pickle(FLAGS.load_dataset_state))
@@ -132,7 +133,12 @@ def main(argv):
     simulated_batch_size = real_batch_size * FLAGS.optimizer.accumulate_gradient_steps
     logging.info(f"Make sure your scheduler steps are based on the simulated batch size: {simulated_batch_size}!")
 
-    model = FlaxSoupLLMForCausalLMModule(
+    image_idx_length = dataset.image_idx_length
+    num_images = dataset.config.num_images
+    num_patches = dataset.config.num_patches
+    num_pixels_per_patch = dataset.config.num_pixels_per_patch
+    
+    model = FlaxSoupLMMForCausalLMModule(
         model_config, 
         dtype=get_float_dtype_by_name(FLAGS.dtype), 
         param_dtype=get_float_dtype_by_name(FLAGS.param_dtype),
@@ -140,8 +146,8 @@ def main(argv):
     
     optimizer, optimizer_info = OptimizerFactory.get_optimizer(
         FLAGS.optimizer,
-        get_weight_decay_mask(SoupLLMConfig.get_weight_decay_exclusions()),
-        get_trainable_params_mask(SoupLLMConfig.get_trainable_params()),
+        get_weight_decay_mask(SoupLMMConfig.get_weight_decay_exclusions()),
+        get_trainable_params_mask(SoupLMMConfig.get_trainable_params()),
     )
 
     def create_trainstate_from_params(params):
@@ -150,9 +156,11 @@ def main(argv):
     def init_fn(rng):
         rng_generator = JaxRNG(rng)
         params = model.init(
-            input_ids=jnp.zeros((1, seq_length), dtype=jnp.int32),
-            position_ids=jnp.zeros((1, seq_length), dtype=jnp.int32),
-            attention_mask=jnp.ones((1, seq_length), dtype=jnp.int32),
+            input_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
+            position_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
+            attention_mask=jnp.ones((4, seq_length), dtype=jnp.int32),
+            images=jnp.ones((4, num_images, num_patches, num_pixels_per_patch), dtype=jnp.float32),
+            image_input_idx=jnp.ones((4, num_images, image_idx_length), dtype=jnp.int32),
             rngs=rng_generator(model_config.rng_keys()),
         )
         return TrainState.create(params=params, tx=optimizer, apply_fn=None)
@@ -230,7 +238,7 @@ def main(argv):
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
     
     train_state_partition = match_partition_rules(
-        SoupLLMConfig.get_partition_rules(), train_state_shapes
+        SoupLMMConfig.get_partition_rules(), train_state_shapes
     )
     
     shard_fns, gather_fns = make_shard_and_gather_fns(

@@ -15,6 +15,13 @@ from .preprocessors import *
 TFDS_DATA_DIR = "gs://unified-io-2-us-east/"
 MULTITASK_TFDS_DATA_DIR = f"{TFDS_DATA_DIR}multitask-datasets"
 
+MULTIMODAL_OUTPUT_FEATURES = {
+  "targets": dataset_providers.Feature(get_default_vocabulary()),
+  "decoder_loss_weights": seqio.ContinuousFeature(dtype=tf.int32, rank=1),
+  "images": seqio.ContinuousFeature(dtype=tf.float32, rank=3),
+  "image_input_idx": seqio.ContinuousFeature(dtype=tf.int32, rank=2),
+}
+
 TEXT_OUTPUT_FEATURES = {
   "targets": dataset_providers.Feature(get_default_vocabulary()),
   # "decoder_loss_weights": seqio.ContinuousFeature(dtype=tf.int32, rank=1),
@@ -170,3 +177,51 @@ TaskRegistry.add(
   output_features=TEXT_OUTPUT_FEATURES,
 )
 
+TaskRegistry.add(
+  "coco_caption_2017",
+  source=seqio.TfdsDataSource(
+    tfds_name="coco_all:1.0.1",
+    tfds_data_dir=MULTITASK_TFDS_DATA_DIR,
+  ),
+  preprocessors=[
+    functools.partial(
+      rekey, key_map={
+        "image/filename": ["image/filename"], 
+        "image": ["image"],
+        "text": ["captions", "text"]
+      }),
+    functools.partial(
+      multimodal_preprocessor,
+      prompt_type="mistral",
+      flatten_by_caption=True,
+    ),
+  ],
+  output_features=MULTIMODAL_OUTPUT_FEATURES,
+)
+
+TaskRegistry.add(
+  "llava_v1_5_mix665k",
+  source=seqio.TfdsDataSource(
+    tfds_name="llava_insturct_mix665k:1.0.0",
+    tfds_data_dir="gs://mm-olmo/datasets/",
+  ),
+  preprocessors=[
+    functools.partial(
+      rekey, key_map={
+        "image": ["image"],
+        "conversations": ["conversations"],
+        "has_image": ["has_image"],
+      }),
+    functools.partial(
+      multimodal_preprocessor,
+      prompt_type="vicuna_v1",
+      use_img_start_end_token=False,
+      use_col_tokens=False,
+      image_token_length_w=24,
+      image_token_length_h=24,
+      max_num_patches=1,
+      mode='resize',
+    ),
+  ],
+  output_features=MULTIMODAL_OUTPUT_FEATURES,
+)

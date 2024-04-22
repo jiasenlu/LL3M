@@ -1,0 +1,22 @@
+from __gin__ import dynamic_registration
+import data
+
+from data import preprocessors
+from data import data_utils
+
+preprocessors.multimodal_preprocessor:
+    image_token_length_w = 24
+    image_token_length_h = 24
+    use_col_tokens = False
+    use_img_start_end_token = False
+    prompt_type = 'llava'
+    
+preprocessors.image_to_patches_and_tokens:
+    mode="resize"
+    max_num_patches = 1
+    base_image_input_size = [336, 336]
+    base_image_input_d = 14
+
+data_utils.get_default_vocabulary:
+    tokenizer_type = 'llama'
+    has_extra_token = True
