@@ -6,12 +6,12 @@ The following table shows the difference between the different LLM implementatio
 
 | Model| Tokenizer | vocab_size | #Params|  tie_word_embeddings | has_bias | GQV | norm_module |
 | ---- | ---- | ---- | ---- | --- | --- | --- | --- |
-| llama2 | llama2 | 32000 | 7B | False | False | No | RMSNorm |
+| llama2 | llama2 | 32000 | 7B (13/70) | False | False | No | RMSNorm |
 | openLLama | llama2 | 32000 | 3B | False | False | No | RMSNorm |
 | tinyLLama | llama2 | 32000 | 1.3B | False | False | No | RMSNorm |
 | mistral | mistral | 32000 | 7B | False | False | Yes | RMSNorm |
-| gemma | gemma | 2B | 256000 | True | False | Yes | GemmaRMSNorm |
-| phi-2 | phi-2 | 2B | 51200 | True | True | Yes | LayerNorm |
+| gemma | gemma | 256000 | 2B (7) | True | False | Yes | GemmaRMSNorm |
+| phi-2 | phi-2 | 51200 | 2B | False | True | No | LayerNorm |
 
 Gemma RMSNorm is a variant of RMSNorm that instead of intialized with 1, it is initialized with 0, and added 1 after normalization.
 

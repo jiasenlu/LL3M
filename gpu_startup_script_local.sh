@@ -7,14 +7,13 @@ set -e
 # this locks the python executable down to hopefully stop if from being fiddled with...
 screen -d -m python3 -c 'import time; time.sleep(999999999)'
 
-# install the latest 
-# sudo apt-get install -y -qq software-properties-common
-# sudo add-apt-repository -y ppa:deadsnakes/ppa
-# sudo apt-get install -y -qq python3.10-full python3.10-dev
+wget https://repo.anaconda.com/archive/Anaconda3-2024.02-1-Linux-x86_64.sh
+bash Anaconda3-2024.02-1-Linux-x86_64.sh -b -p $HOME/Anaconda
+source $HOME/anaconda3/bin/activate
 
 # Create venv
-python3.10 -m venv $HOME/.LL3M
-. $HOME/.LL3M/bin/activate
+conda create --name LL3M python=3.10 -y
+conda activate LL3M
 
 pip3 install -U pip
 pip3 install -U wheel
@@ -22,7 +21,7 @@ pip3 install -U wheel
 pip3 install pyopenssl --upgrade
 
 cd ~/LL3M
-python3 -m pip install -e '.[tpu]' --upgrade --force-reinstall --no-cache-dir -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+python3 -m pip install -e '.[gpu]' --upgrade --force-reinstall --no-cache-dir -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 pip3 install --upgrade fabric dataclasses tqdm cloudpickle smart_open[gcs] func_timeout aioredis==1.3.1
 pip3 install httplib2
 
