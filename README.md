@@ -52,9 +52,9 @@ For more information, please refer to the doc
 
 ## Release Plan
 - [x] Language Model and Seqio Dataloader for Dolma dataset.
-- [ ] Multimodal Model that supports LLava, caption, and others. 
+- [x] Multimodal Model that supports LLava, caption, and others. 
+- [x] The shaped model combines different variances that can serve as an initial MoE model. 
 - [ ] A mixtral type of MoE model can be trained from scratch or existing dense models.
-- [ ] The shaped model combines different variances that can serve as an initial MoE model. 
 - [ ] DPO and RLHF on LLM, LMM and MoE. 
 
 ## Credits
